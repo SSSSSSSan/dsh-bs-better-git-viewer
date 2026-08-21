@@ -13,7 +13,7 @@
  * The exclude list (`.dsh-bs-git-excludes` in the session cwd) is edited in
  * the sidebar settings panel (the tab's gear): one directory name per line.
  */
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { IconBranchOutline16, IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TabComponentProps } from 'dsh-better-sidebar/client/service'
@@ -30,11 +30,38 @@ const LANE_W = 12
 const NODE_R = 4
 /** Radius of the rounded corner where a merge connector meets a lane. */
 const MERGE_R = 4
+/** Extra commit rows rendered above/below the viewport window. */
+const OVERSCAN = 8
+/** Bottom margin of the commit-detail box (mirrors .commitDetail's 8px). */
+const DETAIL_MARGIN_BOTTOM = 8
 
 /** Commit-detail panel sizing (drag-resizable, same pattern as the diff block). */
 const DETAIL_DEFAULT_HEIGHT = 320
 const DETAIL_MIN_HEIGHT = 120
 const DETAIL_MAX_HEIGHT = 560
+
+/** Height of one commit row block: the graph row itself (ROW_H, taller when
+ *  refs stack vertically). Shared between rendering and the virtualization
+ *  offsets so the two can never disagree. */
+function rowHeightOf(row: GraphRow, currentBranch?: string): number {
+  const refs = parseRefs(row.commit.refs, currentBranch)
+  const refsStackH = refs.length > 0 ? refs.length * 17 - 3 : 0
+  return Math.max(ROW_H, refsStackH)
+}
+
+/** First index in `offsets` whose cumulative offset exceeds `value`
+ *  (offsets.length when `value` is past the end). Row `j` starts at
+ *  offsets[j], so rows in [start, end) cover the range (startVal, endVal]. */
+function lowerBoundIndex(offsets: number[], value: number): number {
+  let lo = 0
+  let hi = offsets.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (offsets[mid]! <= value) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
 
 /** Lane spacing is FIXED (small): dynamic widths moved the same lane's line
  *  between rows when the lane count crossed a threshold, breaking the
@@ -135,6 +162,43 @@ export function GitView(props: TabComponentProps): ReactNode {
     setRows(layoutRef.current.append(entries))
   }, [])
 
+  // ── Virtualized commit list ─────────────────────────────────────────────
+  // Only the commit rows inside the viewport (± overscan) are rendered; a
+  // spacer of the total content height drives the scrollbar. Rows have
+  // VARIABLE heights (refs stack vertically; an expanded commit adds its
+  // detail box), so a cumulative-offsets array maps row index -> y position.
+  // The window is recomputed on scroll; offsets only when rows/expansion/
+  // detail-height change (append, expand, drag) — never on scroll.
+  const [windowRange, setWindowRange] = useState({ start: 0, end: 0 })
+  // offsets live in a ref so updateWindow (defined early, used by loadAll)
+  // can read the latest offsets without recreating itself on every change.
+  const offsetsRef = useRef<number[]>([])
+
+  /** Recompute which rows must be in the DOM for the current scroll position. */
+  const updateWindow = useCallback((): void => {
+    const el = listRef.current
+    const offs = offsetsRef.current
+    if (el === null || offs.length === 0) return
+    const st = Math.max(0, el.scrollTop)
+    const vh = Math.max(0, el.clientHeight)
+    const over = OVERSCAN * ROW_H
+    // First row whose bottom edge (offsets[i+1]) is past the window top; the
+    // lb-1 accounts for the row whose top is inside the overscan but whose
+    // bottom still crosses it. Clamped so an out-of-range scrollTop (browser
+    // clamps it anyway) can never produce an empty window.
+    const start = Math.min(
+      Math.max(0, lowerBoundIndex(offs, st - over) - 1),
+      Math.max(0, rows.length - 1),
+    )
+    // End is exclusive: the first row whose TOP is at/below the window bottom
+    // (a row exactly touching the bottom edge renders nothing extra, keeping
+    // the window identical to the strict [top < bottom) reference).
+    let end = lowerBoundIndex(offs, st + vh + over)
+    if (end > start && offs[end - 1]! >= st + vh + over) end -= 1
+    end = Math.min(end, rows.length)
+    setWindowRange(prev => (prev.start === start && prev.end === end ? prev : { start, end }))
+  }, [rows.length])
+
   // Remember the user's repo selection per session+cwd; a remembered root
   // that is gone (excluded / deleted / different workspace) falls back to
   // the default behavior on the next load.
@@ -194,6 +258,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       setCommitDetail(null)
       setFileDiff(null)
       listRef.current?.scrollTo(0, 0)
+      updateWindow() // scrollTo doesn't fire a scroll event — recompute manually
     } catch (reason) {
       if (epoch === logEpoch.current) {
         setError(reason instanceof Error ? reason.message : String(reason))
@@ -201,7 +266,7 @@ export function GitView(props: TabComponentProps): ReactNode {
     } finally {
       if (epoch === logEpoch.current) setLoading(false)
     }
-  }, [scope.sessionId, scope.cwd, rebuildLayout])
+  }, [scope.sessionId, scope.cwd, rebuildLayout, updateWindow])
 
   useEffect(() => { void loadRepos() }, [loadRepos])
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
@@ -365,15 +430,24 @@ export function GitView(props: TabComponentProps): ReactNode {
     }
   }
 
-  /** Lazy load: fetch the next batch when the user scrolls near the bottom. */
+  /** Lazy load + virtual window: on every scroll, recompute which rows are
+   *  visible and fetch the next batch when near the bottom. */
   const onListScroll = useCallback((): void => {
     if (!visibleRef.current) return
+    updateWindow()
     const el = listRef.current
     if (el === null || logEnded || loading || loadingMoreRef.current) return
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 80) {
       void loadMoreLog()
     }
-  }, [logEnded, loading, loadMoreLog])
+  }, [logEnded, loading, loadMoreLog, updateWindow])
+
+  // Recompute the render window whenever the rows/offsets change (appends,
+  // expansions, drag-resize) or the tab becomes visible again (the container
+  // was display:none, so its clientHeight was 0 while hidden).
+  useEffect(() => {
+    updateWindow()
+  }, [updateWindow, visible])
 
   // Fill the tab: keep fetching while the log is shorter than the viewport
   // (no button needed — the list grows until it fills the panel or history
@@ -436,6 +510,25 @@ export function GitView(props: TabComponentProps): ReactNode {
   const currentBranch = status?.branch
   // Keep the layout rebuilds (async callbacks) on the LATEST branch value.
   branchRef.current = currentBranch
+
+  // Variable-height virtualization offsets: cumulative y positions of every
+  // loaded row (an expanded commit also contributes its detail box). Computed
+  // only when the row set / expansion / detail height changes — scrolling
+  // itself never rebuilds this array.
+  const offsets = useMemo(() => {
+    const arr = new Array<number>(rows.length + 1)
+    arr[0] = 0
+    for (let i = 0; i < rows.length; i++) {
+      let h = rowHeightOf(rows[i]!, currentBranch)
+      if (commitDetail !== null && commitDetail.hashFull === rows[i]!.commit.hashFull) {
+        h += detailHeight + DETAIL_MARGIN_BOTTOM
+      }
+      arr[i + 1] = arr[i]! + h
+    }
+    return arr
+  }, [rows, currentBranch, commitDetail, detailHeight])
+  offsetsRef.current = offsets
+  const totalHeight = offsets[rows.length] ?? 0
 
   // The branch feeds the graph's fork rule; when it changes (checkout / reset
   // surfaced by a status refresh) re-lay-out the whole loaded history. The
@@ -571,23 +664,31 @@ export function GitView(props: TabComponentProps): ReactNode {
         </div>
       )}
 
-      {/* ── History: commit graph (scrolls + lazy-loads) ── */}
+      {/* ── History: commit graph (virtualized + lazy-loads) ── */}
       <div className={css.sectionTitle}>历史</div>
       <div className={css.logList} ref={listRef} onScroll={onListScroll}>
-        {rows.map(row => {
-          const selected = commitDetail !== null && commitDetail.hashFull === row.commit.hashFull
-          return (
-            <Fragment key={row.commit.hashFull}>
-              <CommitGraphRow
-                row={row}
-                currentBranch={currentBranch}
-                selected={selected}
-                onClick={() => { void openCommit(row.commit) }}
-              />
-              {selected && commitDetailNode()}
-            </Fragment>
-          )
-        })}
+        {/* Spacer carries the scrollbar; only the visible window is in the DOM. */}
+        <div className={css.logSpacer} style={{ height: totalHeight }}>
+          {rows.slice(windowRange.start, windowRange.end).map((row, i) => {
+            const absIndex = windowRange.start + i
+            const selected = commitDetail !== null && commitDetail.hashFull === row.commit.hashFull
+            return (
+              <div
+                key={row.commit.hashFull}
+                className={css.logVirtualRow}
+                style={{ transform: `translateY(${offsets[absIndex] ?? 0}px)` }}
+              >
+                <CommitGraphRow
+                  row={row}
+                  currentBranch={currentBranch}
+                  selected={selected}
+                  onClick={() => { void openCommit(row.commit) }}
+                />
+                {selected && commitDetailNode()}
+              </div>
+            )
+          })}
+        </div>
         {loadingMore && <div className={css.statusLine}>加载中…</div>}
       </div>
     </div>
@@ -612,8 +713,9 @@ function CommitGraphRow(props: {
   // carrying n refs is max(ROW_H, 17n − 3) tall; the SVG lane drawing grows
   // with it (node re-centered at midY), keeping vertical lines continuous
   // across rows of different heights (top/bottom halves meet at row borders).
-  const refsStackH = refs.length > 0 ? refs.length * 17 - 3 : 0
-  const rowH = Math.max(ROW_H, refsStackH)
+  // rowHeightOf is SHARED with the virtualization offsets so the layout math
+  // can never drift from what is actually rendered.
+  const rowH = rowHeightOf(row, currentBranch)
   const midY = rowH / 2
   return (
     <div

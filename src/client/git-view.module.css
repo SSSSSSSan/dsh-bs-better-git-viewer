@@ -354,6 +354,20 @@
   padding: 0 8px 8px;
 }
 
+/* Virtualized commit list: a relative spacer of the full content height
+   drives the scrollbar; each rendered row is absolutely positioned at its
+   cumulative offset (translateY for compositor-friendly scrolling). */
+.logSpacer {
+  position: relative;
+}
+
+.logVirtualRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+}
+
 .graphRow {
   display: flex;
   align-items: center;
