@@ -25,6 +25,10 @@ import { DiffBlock } from './DiffBlock.tsx'
 import css from './git-view.module.css'
 
 const LOG_BATCH = 100
+/** Hard cap on loaded log entries: virtualization keeps the DOM small, but
+ *  the entries array + graph rows + offsets still grow — this bounds memory
+ *  on truly enormous histories (50k entries ≈ a few MB of raw data). */
+const LOG_MAX_ENTRIES = 50_000
 const ROW_H = 22
 const LANE_W = 12
 const NODE_R = 4
@@ -413,12 +417,17 @@ export function GitView(props: TabComponentProps): ReactNode {
     try {
       const result = await api.log(currentRoot, scope, LOG_BATCH, skip)
       if (epoch !== logEpoch.current) return // a reset happened mid-flight: drop
+      // Enforce the hard cap: never accumulate more than LOG_MAX_ENTRIES, and
+      // mark the log ended once the cap is hit (deeper history then requires a
+      // narrower query — out of scope for the lazy pager).
+      const before = logEntriesRef.current.length
+      const take = before >= LOG_MAX_ENTRIES ? [] : result.entries.slice(0, LOG_MAX_ENTRIES - before)
       // Append both the entries and their graph rows — the walker only lays
       // out the NEW batch, so deep browsing stays O(batch) per page.
-      setLogEntries(prev => [...prev, ...result.entries])
-      const newRows = layoutRef.current?.append(result.entries) ?? []
+      setLogEntries(prev => [...prev, ...take])
+      const newRows = layoutRef.current?.append(take) ?? []
       setRows(prev => [...prev, ...newRows])
-      setLogEnded(result.entries.length < LOG_BATCH)
+      setLogEnded(take.length < LOG_BATCH || before + take.length >= LOG_MAX_ENTRIES)
       logSkipRef.current = skip
     } catch (reason) {
       if (epoch === logEpoch.current) {
@@ -690,6 +699,12 @@ export function GitView(props: TabComponentProps): ReactNode {
           })}
         </div>
         {loadingMore && <div className={css.statusLine}>加载中…</div>}
+        {logEnded && logEntries.length >= LOG_MAX_ENTRIES && (
+          <div className={css.statusLine}>已达加载上限（{LOG_MAX_ENTRIES} 条），更深的历史未加载</div>
+        )}
+        {logEnded && logEntries.length > 0 && logEntries.length < LOG_MAX_ENTRIES && (
+          <div className={css.statusLine}>已到最早提交</div>
+        )}
       </div>
     </div>
   )
