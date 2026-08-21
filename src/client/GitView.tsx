@@ -36,6 +36,14 @@ const NODE_R = 4
 const MERGE_R = 4
 /** Extra commit rows rendered above/below the viewport window. */
 const OVERSCAN = 12
+/** Lane slide (prune) transition duration — matches the <g> transform
+ *  transition and the row-width transition. */
+const SLIDE_MS = 250
+/** Exit/enter fade duration for lanes removed/added by a scroll-stopped prune. */
+const LANE_EXIT_MS = 220
+/** Prune retention band: columns with a node inside window ± 2×OVERSCAN stay
+ *  rendered (hysteresis — oscillating around the boundary does not pop lanes). */
+const PRUNE_OVERSCAN = OVERSCAN * 2
 /** Load the next batch when the remaining scrollable content is less than
  *  this many viewport heights — loads AHEAD of the bottom so a long downward
  *  scroll never stalls waiting for the network (80px was too late). */
@@ -200,18 +208,85 @@ export function GitView(props: TabComponentProps): ReactNode {
   const windowRangeRef = useRef(windowRange)
   windowRangeRef.current = windowRange
   const [visibleColumns, setVisibleColumns] = useState<number[]>([])
-  const [lanesAnimating, setLanesAnimating] = useState(false)
-  const lanesKey = visibleColumns.join(',')
-  const pruneFlag = useRef(false)
-  // One-shot fade/slide after a PRUNE (scroll stopped); a grow (a node column
-  // scrolling into view) must not animate mid-scroll.
-  useEffect(() => {
-    if (!pruneFlag.current) return
-    pruneFlag.current = false
-    setLanesAnimating(true)
-    const t = window.setTimeout(() => setLanesAnimating(false), 320)
-    return () => window.clearTimeout(t)
-  }, [lanesKey])
+  // Prune animation state: `pruneSliding` gates the lane/width transitions
+  // (only a scroll-stopped PRUNE may animate; grows snap into place so lanes
+  // never lag the scroll). `exitingLanes` are lanes pruned away that fade out
+  // in place; `pruneAdded` are lanes entering during the same prune (fade in).
+  const [pruneSliding, setPruneSliding] = useState(false)
+  const [exitingLanes, setExitingLanes] = useState<number[]>([])
+  const [pruneAdded, setPruneAdded] = useState<number[]>([])
+  // `settling` gates the row-WIDTH transition: the width only shrinks when the
+  // exiting lanes unmount (LANE_EXIT_MS), so it must stay transitionable past
+  // the 250ms transform slide until that shrink has finished.
+  const [settling, setSettling] = useState(false)
+  // Mirrors for decision-making inside handlers (handlers run between renders,
+  // so the refs always hold the committed values).
+  const visibleColumnsRef = useRef(visibleColumns)
+  visibleColumnsRef.current = visibleColumns
+  const pruneSlidingRef = useRef(pruneSliding)
+  pruneSlidingRef.current = pruneSliding
+  const settlingRef = useRef(settling)
+  settlingRef.current = settling
+  const exitingLanesRef = useRef(exitingLanes)
+  exitingLanesRef.current = exitingLanes
+  const pruneAddedRef = useRef(pruneAdded)
+  pruneAddedRef.current = pruneAdded
+  const slideTimer = useRef<number | undefined>(undefined)
+  const settleTimer = useRef<number | undefined>(undefined)
+  const exitTimer = useRef<number | undefined>(undefined)
+
+  /** Commit one visible-set change. `fromPrune` decides whether it animates:
+   *  only a scroll-stopped PRUNE may slide lanes / fade exits; every grow (a
+   *  node scrolling into view, a batch append, a tab reveal) snaps into place.
+   *  A grow that lands inside a prune animation window cancels that animation
+   *  (the user started scrolling again). */
+  const applyVisibleSet = useCallback((next: number[], fromPrune: boolean): void => {
+    const prev = visibleColumnsRef.current
+    if (prev.length === next.length && prev.every((v, i) => v === next[i])) return
+    const removed = prev.filter(j => !next.includes(j))
+    const added = next.filter(j => !prev.includes(j))
+    if (fromPrune) {
+      if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+      if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+      if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
+      setPruneSliding(true)
+      setSettling(true)
+      setExitingLanes(removed)
+      setPruneAdded(added)
+      slideTimer.current = window.setTimeout(() => setPruneSliding(false), SLIDE_MS)
+      // The width shrink only starts when the exits unmount, so the settle
+      // window outlives the transform slide.
+      settleTimer.current = window.setTimeout(() => setSettling(false), LANE_EXIT_MS + SLIDE_MS)
+      exitTimer.current = window.setTimeout(() => {
+        setExitingLanes([])
+        setPruneAdded([])
+      }, LANE_EXIT_MS)
+    } else {
+      if (pruneSlidingRef.current) {
+        setPruneSliding(false)
+        if (slideTimer.current !== undefined) {
+          window.clearTimeout(slideTimer.current)
+          slideTimer.current = undefined
+        }
+      }
+      if (settlingRef.current) {
+        setSettling(false)
+        if (settleTimer.current !== undefined) {
+          window.clearTimeout(settleTimer.current)
+          settleTimer.current = undefined
+        }
+      }
+      if (exitingLanesRef.current.length > 0 || pruneAddedRef.current.length > 0) {
+        setExitingLanes([])
+        setPruneAdded([])
+        if (exitTimer.current !== undefined) {
+          window.clearTimeout(exitTimer.current)
+          exitTimer.current = undefined
+        }
+      }
+    }
+    setVisibleColumns(next)
+  }, [])
   const pruneTimer = useRef<number | undefined>(undefined)
 
   /** Columns carrying a node or merge cell in rows [from, to). */
@@ -230,36 +305,33 @@ export function GitView(props: TabComponentProps): ReactNode {
   }, [])
 
   /** Union the window's node columns into the visible set (no animation —
-   *  runs mid-scroll so an incoming node never disappears). */
+   *  runs mid-scroll so an incoming node never disappears; lanes snap). */
   const growVisibleColumns = useCallback((from: number, to: number): void => {
     const cols = windowLaneColumns(from, to)
     if (cols.length === 0) return
-    setVisibleColumns(prev => {
-      let changed = false
-      const next = [...prev]
-      for (const j of cols) {
-        if (!next.includes(j)) {
-          next.push(j)
-          changed = true
-        }
+    const prev = visibleColumnsRef.current
+    const next = [...prev]
+    let changed = false
+    for (const j of cols) {
+      if (!next.includes(j)) {
+        next.push(j)
+        changed = true
       }
-      if (!changed) return prev
-      next.sort((a, b) => a - b)
-      return next
-    })
-  }, [windowLaneColumns])
+    }
+    if (!changed) return
+    next.sort((a, b) => a - b)
+    applyVisibleSet(next, false)
+  }, [windowLaneColumns, applyVisibleSet])
 
-  /** Prune the visible set back to the window (± overscan) once scrolling
-   *  settles — this is what hides the viewport's pure passing lines. */
+  /** Prune the visible set back to the window (± PRUNE_OVERSCAN) once
+   *  scrolling settles — this is what hides the viewport's pure passing
+   *  lines. The prune is the ONLY change that animates (slide + per-lane
+   *  exit/enter fades). */
   const pruneVisibleColumns = useCallback((): void => {
     const r = windowRangeRef.current
-    const cols = windowLaneColumns(r.start - OVERSCAN, r.end + OVERSCAN)
-    setVisibleColumns(prev => {
-      if (prev.length === cols.length && prev.every((v, i) => v === cols[i])) return prev
-      pruneFlag.current = true
-      return cols
-    })
-  }, [windowLaneColumns])
+    const cols = windowLaneColumns(r.start - PRUNE_OVERSCAN, r.end + PRUNE_OVERSCAN)
+    applyVisibleSet(cols, true)
+  }, [windowLaneColumns, applyVisibleSet])
   // offsets live in a ref so updateWindow (defined early, used by loadAll)
   // can read the latest offsets without recreating itself on every change.
   const offsetsRef = useRef<number[]>([])
@@ -269,6 +341,9 @@ export function GitView(props: TabComponentProps): ReactNode {
     const el = listRef.current
     const offs = offsetsRef.current
     if (el === null || offs.length === 0) return
+    // Hidden tabs report clientHeight = 0: computing the window there would
+    // degenerate it to a 1-2 row band (and pollute the visible set). Skip.
+    if (!visibleRef.current) return
     const st = Math.max(0, el.scrollTop)
     const vh = Math.max(0, el.clientHeight)
     const over = OVERSCAN * ROW_H
@@ -332,7 +407,22 @@ export function GitView(props: TabComponentProps): ReactNode {
     }
   }, [scope.sessionId, scope.cwd])
 
+  /** Clear the lane projection for a whole-list reset (repo switch, manual
+   *  refresh): a fresh browse starts from an empty visible set, so no stale
+   *  lanes from the previous scroll position linger. */
+  const resetLaneProjection = (): void => {
+    if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+    if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+    if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
+    setPruneSliding(false)
+    setSettling(false)
+    setExitingLanes([])
+    setPruneAdded([])
+    setVisibleColumns([])
+  }
+
   const loadAll = useCallback(async (root: string | null): Promise<void> => {
+    resetLaneProjection()
     if (root === null) {
       setStatus(null)
       setLogEntries([])
@@ -550,11 +640,14 @@ export function GitView(props: TabComponentProps): ReactNode {
     })
   }, [logEnded, loading, loadMoreLog, updateWindow, pruneVisibleColumns])
 
-  // Cancel pending scroll rAF + prune timer on unmount.
+  // Cancel pending scroll rAF + prune/slide/exit timers on unmount.
   useEffect(() => {
     return () => {
       if (scrollRafRef.current !== undefined) cancelAnimationFrame(scrollRafRef.current)
       if (pruneTimer.current !== undefined) window.clearTimeout(pruneTimer.current)
+      if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+      if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+      if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
     }
   }, [])
 
@@ -797,7 +890,10 @@ export function GitView(props: TabComponentProps): ReactNode {
                   currentBranch={currentBranch}
                   selected={selected}
                   visibleColumns={visibleColumns}
-                  animating={lanesAnimating}
+                  exitingLanes={exitingLanes}
+                  pruneAdded={pruneAdded}
+                  slide={pruneSliding}
+                  settling={settling}
                   onClick={() => { void openCommit(row.commit) }}
                 />
                 {selected && commitDetailNode()}
@@ -827,23 +923,35 @@ function CommitGraphRow(props: {
   currentBranch?: string
   selected: boolean
   visibleColumns: number[]
-  animating: boolean
+  exitingLanes: number[]
+  pruneAdded: number[]
+  slide: boolean
+  settling: boolean
   onClick: () => void
 }): ReactNode {
-  const { row, currentBranch, selected, visibleColumns, animating, onClick } = props
+  const { row, currentBranch, selected, visibleColumns, exitingLanes, pruneAdded, slide, settling, onClick } = props
   const { commit, cells, above, below, merges, colors } = row
   const refs = parseRefs(commit.refs, currentBranch)
   const nodeLane = cells.indexOf('node')
   const lw = laneWidth(visibleColumns.length)
-  // Projection: lane j renders at its ORDER within visibleColumns. The g is
-  // drawn at its original column (x = j*lw + lw/2) and translated by
-  // (order - j) * lw, so when the visible set changes the lane slides.
+  // Projection: kept lane j renders at its ORDER within visibleColumns. The g
+  // is drawn at its original column (x = j*lw + lw/2) and translated by
+  // (order - j) * lw. A lane EXITING after a prune keeps a "phantom" order =
+  // the slot it would occupy were it still in the set, so the gap closes
+  // around it while it fades out (survivors are already at their final slots).
   const visIndex = new Map<number, number>()
   visibleColumns.forEach((j, idx) => visIndex.set(j, idx))
-  // A-1: the row width is the LAST VISIBLE active column's projected order
-  // + 1 (merge connectors reach their target lane, so include it). Keeps the
-  // note text pressed against the row's last visible line instead of leaving
-  // blank columns from lanes that happen to have no content in this row.
+  for (const j of exitingLanes) {
+    if (visIndex.has(j)) continue
+    let phantom = 0
+    for (const v of visibleColumns) if (v < j) phantom++
+    visIndex.set(j, phantom)
+  }
+  // The row width is the LAST VISIBLE active column's projected order + 1
+  // (merge connectors reach their target lane, so include it). Keeps the note
+  // text pressed against the row's last visible line instead of leaving blank
+  // columns from lanes that happen to have no content in this row. The width
+  // TRANSITIONS with the slide so the text never snaps while lanes settle.
   let rowMaxOrder = -1
   const considerOrder = (j: number): void => {
     const order = visIndex.get(j)
@@ -863,14 +971,54 @@ function CommitGraphRow(props: {
   // can never drift from what is actually rendered.
   const rowH = rowHeightOf(row, currentBranch)
   const midY = rowH / 2
+  // Merge connectors are drawn INSIDE the node lane's <g>, in that lane's
+  // LOCAL frame (node end at the lane's own x), so they slide rigidly with
+  // the node and never detach from it mid-transition. At the final positions
+  // the local coordinates are exact for BOTH ends, so the corner meets the
+  // target lane's line correctly once the slide settles.
+  const nodeOrder = visIndex.get(nodeLane)
+  const connectorPaths = nodeLane >= 0 && nodeOrder !== undefined
+    ? merges.filter(j => j !== nodeLane && visIndex.has(j)).map(j => {
+        const targetOrder = visIndex.get(j)!
+        const x1 = nodeLane * lw + lw / 2
+        const x2 = targetOrder * lw + lw / 2 - (nodeOrder - nodeLane) * lw
+        const color = laneColor(colors[j] ?? j)
+        const dirX = x2 > x1 ? 1 : -1
+        const hx = x2 - dirX * MERGE_R
+        // Rounded quadratic corner (no SVG arc sweep ambiguity): horizontal
+        // run from the node, then a smooth 90° turn into the target lane's
+        // line — down when the lane continues below, up when it ends here.
+        const dirY = below[j] ? 1 : -1
+        const d = `M ${x1} ${midY} H ${hx} Q ${x2} ${midY} ${x2} ${midY + dirY * MERGE_R}`
+        return (
+          <path
+            key={`m${j}`}
+            d={d}
+            fill="none"
+            stroke={color}
+            strokeWidth={1.5}
+            strokeLinecap="round"
+          />
+        )
+      })
+    : null
   return (
     <div
-      className={`${css.graphRow}${selected ? ' ' + css.graphRowSelected : ''}${animating ? ' ' + css.laneFadeIn : ''}`}
+      className={`${css.graphRow}${selected ? ' ' + css.graphRowSelected : ''}`}
       onClick={onClick}
       title={commit.subject}
       role="button"
     >
-      <svg className={css.graphSvg} width={width} height={rowH} style={{ minWidth: width }}>
+      <svg
+        className={css.graphSvg}
+        width={width}
+        height={rowH}
+        style={{
+          width,
+          minWidth: width,
+          transition: settling ? `width ${SLIDE_MS}ms ease` : 'none',
+        }}
+      >
         {cells.map((cell, j) => {
           const order = visIndex.get(j)
           if (cell === 'none' || order === undefined) return null // hidden lane
@@ -907,38 +1055,27 @@ function CommitGraphRow(props: {
                 strokeWidth={1.5}
               />,
             )
+            if (connectorPaths !== null) segs.push(...connectorPaths)
           }
+          // Per-lane enter/exit fades, prune only: an exiting lane fades out
+          // in place (survivors slide around it); a lane added by the same
+          // prune fades in. Mid-scroll grows never animate (they snap).
+          const animClass = exitingLanes.includes(j)
+            ? css.laneExit
+            : pruneAdded.includes(j)
+              ? css.laneEnter
+              : undefined
           return (
-            <g key={j} style={{ transform: `translateX(${(order - j) * lw}px)`, transition: 'transform 250ms ease' }}>
+            <g
+              key={j}
+              className={animClass}
+              style={{
+                transform: `translateX(${(order - j) * lw}px)`,
+                transition: slide ? `transform ${SLIDE_MS}ms ease` : 'none',
+              }}
+            >
               {segs}
             </g>
-          )
-        })}
-        {nodeLane >= 0 && merges.map(j => {
-          if (j === nodeLane) return null
-          const targetOrder = visIndex.get(j)
-          if (targetOrder === undefined) return null // merge target lane hidden
-          const nodeOrder = visIndex.get(nodeLane) ?? 0
-          // Connectors use the PROJECTED x positions (the lanes have slid).
-          const x1 = nodeOrder * lw + lw / 2
-          const x2 = targetOrder * lw + lw / 2
-          const color = laneColor(colors[j] ?? j)
-          const dirX = x2 > x1 ? 1 : -1
-          const hx = x2 - dirX * MERGE_R
-          // Rounded quadratic corner (no SVG arc sweep ambiguity): horizontal
-          // run from the node, then a smooth 90° turn into the target lane's
-          // line — down when the lane continues below, up when it ends here.
-          const dirY = below[j] ? 1 : -1
-          const d = `M ${x1} ${midY} H ${hx} Q ${x2} ${midY} ${x2} ${midY + dirY * MERGE_R}`
-          return (
-            <path
-              key={`m${j}`}
-              d={d}
-              fill="none"
-              stroke={color}
-              strokeWidth={1.5}
-              strokeLinecap="round"
-            />
           )
         })}
       </svg>

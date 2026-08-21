@@ -390,19 +390,33 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
-/* One-shot fade-in applied to rows right after the visible-lane set changes
-   (a batch brought a node into a previously hidden lane). Scrolling alone
-   never triggers it — the class only exists during the change window. */
-.laneFadeIn {
-  animation: dshLaneFadeIn 220ms ease;
+/* Per-lane enter/exit fades, applied to a lane's <g> only during a
+   scroll-stopped prune: an exiting lane fades out in place (the survivors
+   slide around it), a lane added by the same prune fades in. Mid-scroll
+   grows never animate — they snap into place. */
+.laneEnter {
+  animation: dshLaneEnter 200ms ease;
 }
 
-@keyframes dshLaneFadeIn {
+.laneExit {
+  animation: dshLaneExit 220ms ease forwards;
+}
+
+@keyframes dshLaneEnter {
   from {
     opacity: 0.25;
   }
   to {
     opacity: 1;
+  }
+}
+
+@keyframes dshLaneExit {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
   }
 }
 
