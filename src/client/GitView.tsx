@@ -161,6 +161,15 @@ export function GitView(props: TabComponentProps): ReactNode {
   // hash-change reload) bumps this counter; a loadMoreLog that started before
   // the bump discards its result instead of appending stale/offset batches.
   const logEpoch = useRef(0)
+  // Monotonic id of the most recent loadAll — owns the `loading` flag. A
+  // superseded loadAll must not clear `loading` (a newer one owns it), but a
+  // loadAll invalidated by an epoch bump before completion must not leave it
+  // stuck either: both cases settle on "the latest loadAll decides".
+  const loadIdRef = useRef(0)
+  // The root the loaded history belongs to. loadAll does not otherwise know
+  // whether its `root` differs from what is currently displayed — this ref
+  // detects real repo switches (vs. tip-changed reloads of the same repo).
+  const lastRootRef = useRef<string | null>(null)
   // Incremental commit-graph layout: the walker keeps the lane state across
   // appends, so loading another batch costs O(batch) instead of re-laying-out
   // the whole history. `rows` mirrors logEntries 1:1 (row i renders entry i).
@@ -429,9 +438,32 @@ export function GitView(props: TabComponentProps): ReactNode {
       layoutRef.current = null
       setRows([])
       setLoading(false)
+      lastRootRef.current = null
       return
     }
-    const epoch = ++logEpoch.current
+    // A repo switch must not leave the PREVIOUS repo's rows clickable while
+    // the new log loads: clearing them up-front shows 加载中… instead of the
+    // wrong repo's history, and a stale click becomes a no-op (see openCommit).
+    // A reload of the SAME root (tip moved / manual refresh) keeps the current
+    // rows until the fresh batch arrives (non-destructive). Status is NOT
+    // cleared: doing so would flip the branch mid-load and re-trigger the
+    // branch-change effect for no benefit.
+    const rootChanged = root !== lastRootRef.current
+    lastRootRef.current = root
+    if (rootChanged) {
+      setLogEntries([])
+      setRows([])
+      setDiffView(null)
+      setCommitDetail(null)
+      setFileDiff(null)
+    }
+    // `loadId` owns this invocation: only the LATEST loadAll may apply its
+    // data / clear `loading` / surface its error. logEpoch is bumped too (an
+    // in-flight loadMoreLog must drop), but the branch-change effect ALSO
+    // bumps logEpoch — that must not discard this batch (it is the current
+    // repo's authoritative load), which is why the guard is loadId, not epoch.
+    const loadId = ++loadIdRef.current
+    ++logEpoch.current
     setLoading(true)
     setError(null)
     try {
@@ -439,23 +471,20 @@ export function GitView(props: TabComponentProps): ReactNode {
         api.status(root, scope),
         api.log(root, scope, LOG_BATCH, 0),
       ])
-      if (epoch !== logEpoch.current) return // superseded by a newer reset
+      if (loadId !== loadIdRef.current) return // superseded by a newer loadAll
       setStatus(statusResult)
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
       logSkipRef.current = 0
       rebuildLayout(logResult.entries, statusResult.branch)
-      setDiffView(null)
-      setCommitDetail(null)
-      setFileDiff(null)
       listRef.current?.scrollTo(0, 0)
       updateWindowRef.current() // scrollTo fires no scroll event — recompute manually
     } catch (reason) {
-      if (epoch === logEpoch.current) {
+      if (loadId === loadIdRef.current) {
         setError(reason instanceof Error ? reason.message : String(reason))
       }
     } finally {
-      if (epoch === logEpoch.current) setLoading(false)
+      if (loadId === loadIdRef.current) setLoading(false)
     }
   }, [scope.sessionId, scope.cwd, rebuildLayout])
 
@@ -653,10 +682,13 @@ export function GitView(props: TabComponentProps): ReactNode {
 
   // Recompute the render window whenever the rows/offsets change (appends,
   // expansions, drag-resize) or the tab becomes visible again (the container
-  // was display:none, so its clientHeight was 0 while hidden).
+  // was display:none, so its clientHeight was 0 while hidden). `rows` is a
+  // dependency BY IDENTITY, not just rows.length: a repo switch to another
+  // repo with the same number of loaded rows would otherwise keep the stale
+  // window/lane projection (no lanes for the new history).
   useEffect(() => {
     updateWindow()
-  }, [updateWindow, visible])
+  }, [updateWindow, visible, rows])
 
   // Fill the tab: keep fetching while the log is shorter than a few viewports
   // (no button needed — the list grows until it has room to scroll or history
@@ -673,6 +705,10 @@ export function GitView(props: TabComponentProps): ReactNode {
   /** Toggle a commit's changed-file list; click again to collapse. */
   const openCommit = async (entry: GitLogEntry): Promise<void> => {
     if (currentRoot === null) return
+    // Ignore clicks on rows that are no longer part of the loaded history —
+    // a stale row from the previous repo lingering during a switch would run
+    // git against the NEW repo with the OLD repo's hash ("fatal: bad object").
+    if (!logEntriesRef.current.some(e => e.hashFull === entry.hashFull)) return
     if (commitDetail !== null && commitDetail.hashFull === entry.hashFull) {
       setCommitDetail(null)
       setFileDiff(null)
