@@ -158,15 +158,22 @@ export function GitView(props: TabComponentProps): ReactNode {
   // the whole history. `rows` mirrors logEntries 1:1 (row i renders entry i).
   const layoutRef = useRef<GraphLayoutWalker | null>(null)
   const [rows, setRows] = useState<GraphRow[]>([])
-  // Mirror of the current branch (see below — synced during render after the
-  // status-derived value exists), so layout rebuilds from async callbacks use
-  // the LATEST branch instead of a stale render-time closure.
-  const branchRef = useRef<string | undefined>(undefined)
-
-  /** Rebuild the graph walker from scratch for a full entry list (repo switch,
-   *  refresh, branch change). Uses the live branch via branchRef. */
-  const rebuildLayout = useCallback((entries: GitLogEntry[]): void => {
-    layoutRef.current = createGraphLayout(branchRef.current)
+  /** Rebuild the graph walker for a full entry list (repo switch, refresh,
+   *  branch change). Replaying the SAME sequence (same branch, same tip hash,
+   *  same length) reuses the walker's cached rows — O(1) instead of re-running
+   *  the lane state machine over every loaded commit. */
+  const rebuildLayout = useCallback((entries: GitLogEntry[], branch: string | undefined): void => {
+    const existing = layoutRef.current
+    if (
+      existing !== null
+      && existing.branch === branch
+      && existing.allRows.length === entries.length
+      && existing.allRows[0]?.commit.hashFull === entries[0]?.hashFull
+    ) {
+      setRows(existing.allRows.slice())
+      return
+    }
+    layoutRef.current = createGraphLayout(branch)
     setRows(layoutRef.current.append(entries))
   }, [])
 
@@ -269,7 +276,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
       logSkipRef.current = 0
-      rebuildLayout(logResult.entries)
+      rebuildLayout(logResult.entries, statusResult.branch)
       setDiffView(null)
       setCommitDetail(null)
       setFileDiff(null)
@@ -531,8 +538,6 @@ export function GitView(props: TabComponentProps): ReactNode {
     repos.find(repo => repo.root === root)?.name ?? (root === null ? '—' : root.slice(root.lastIndexOf('\\') + 1))
 
   const currentBranch = status?.branch
-  // Keep the layout rebuilds (async callbacks) on the LATEST branch value.
-  branchRef.current = currentBranch
 
   // Variable-height virtualization offsets: cumulative y positions of every
   // loaded row (an expanded commit also contributes its detail box). Computed
@@ -559,7 +564,7 @@ export function GitView(props: TabComponentProps): ReactNode {
   useEffect(() => {
     if (layoutRef.current === null) return // nothing laid out yet (mount)
     ++logEpoch.current
-    rebuildLayout(logEntriesRef.current)
+    rebuildLayout(logEntriesRef.current, currentBranch)
   }, [currentBranch, rebuildLayout])
 
   /** Drag the commit-detail resize handle to change the box height (120–560px). */
