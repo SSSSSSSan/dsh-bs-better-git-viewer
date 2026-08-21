@@ -352,6 +352,14 @@
   min-height: 0;
   overflow-y: auto;
   padding: 0 8px 8px;
+  /* Virtualized list: the content height grows per batch, so a visible
+     scrollbar thumb jumps on every append. Hide it — wheel, touch and
+     keyboard scrolling still work. */
+  scrollbar-width: none;
+}
+
+.logList::-webkit-scrollbar {
+  display: none;
 }
 
 /* Virtualized commit list: a relative spacer of the full content height

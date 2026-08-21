@@ -35,7 +35,11 @@ const NODE_R = 4
 /** Radius of the rounded corner where a merge connector meets a lane. */
 const MERGE_R = 4
 /** Extra commit rows rendered above/below the viewport window. */
-const OVERSCAN = 8
+const OVERSCAN = 12
+/** Load the next batch when the remaining scrollable content is less than
+ *  this many viewport heights — loads AHEAD of the bottom so a long downward
+ *  scroll never stalls waiting for the network (80px was too late). */
+const LOAD_AHEAD_VH = 3
 /** Bottom margin of the commit-detail box (mirrors .commitDetail's 8px). */
 const DETAIL_MARGIN_BOTTOM = 8
 
@@ -277,30 +281,6 @@ export function GitView(props: TabComponentProps): ReactNode {
   useEffect(() => { void loadRepos() }, [loadRepos])
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
 
-  /** Content-only refresh: status + history, keeping the selected repo,
-   *  expanded diffs and scroll position intact. Bumps the epoch so an
-   *  in-flight loadMoreLog started before it discards its result. */
-  const refreshContent = useCallback(async (): Promise<void> => {
-    if (currentRoot === null) return
-    const epoch = ++logEpoch.current
-    try {
-      const [statusResult, logResult] = await Promise.all([
-        api.status(currentRoot, scope),
-        api.log(currentRoot, scope, LOG_BATCH, 0),
-      ])
-      if (epoch !== logEpoch.current) return
-      setStatus(statusResult)
-      setLogEntries(logResult.entries)
-      setLogEnded(logResult.entries.length < LOG_BATCH)
-      logSkipRef.current = 0
-      rebuildLayout(logResult.entries)
-    } catch (reason) {
-      if (epoch === logEpoch.current) {
-        setError(reason instanceof Error ? reason.message : String(reason))
-      }
-    }
-  }, [currentRoot, scope.sessionId, scope.cwd, rebuildLayout])
-
   /** Refresh just the status (worktree changes don't touch .git, so the
    *  watcher never pings for them). Kept separate from the log so returning
    *  to the tab doesn't have to reset the history. */
@@ -334,6 +314,17 @@ export function GitView(props: TabComponentProps): ReactNode {
       }
     }
   }, [currentRoot, scope.sessionId, scope.cwd, loadAll])
+
+  /** WS-triggered refresh (.git changed). NON-destructive: refresh the status
+   *  and reload the log only if its tip moved (new commits / checkout). A
+   *  stage/unstage or an unrelated fs event must never wipe the user's scroll
+   *  position while they are browsing deep history — that reset was the other
+   *  half of the "scroll jumps back to the top" behaviour. */
+  const refreshContent = useCallback(async (): Promise<void> => {
+    if (currentRoot === null) return
+    await refreshStatus()
+    await refreshLogIfChanged()
+  }, [currentRoot, refreshStatus, refreshLogIfChanged])
 
   // When the tab becomes visible again (returning from another tab), refresh
   // the repo list + status, and reload the history ONLY if its tip moved —
@@ -442,16 +433,31 @@ export function GitView(props: TabComponentProps): ReactNode {
   }
 
   /** Lazy load + virtual window: on every scroll, recompute which rows are
-   *  visible and fetch the next batch when near the bottom. */
+   *  visible and fetch the next batch when the remaining content is less than
+   *  a few viewports (loads AHEAD of the bottom so a long downward scroll
+   *  never stalls waiting for the network). rAF-throttled: a fast scroll must
+   *  not re-render the window rows more than once per frame. */
+  const scrollRafRef = useRef<number | undefined>(undefined)
   const onListScroll = useCallback((): void => {
     if (!visibleRef.current) return
-    updateWindow()
-    const el = listRef.current
-    if (el === null || logEnded || loading || loadingMoreRef.current) return
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 80) {
-      void loadMoreLog()
-    }
+    if (scrollRafRef.current !== undefined) return
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = undefined
+      updateWindow()
+      const el = listRef.current
+      if (el === null || logEnded || loading || loadingMoreRef.current) return
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - el.clientHeight * LOAD_AHEAD_VH) {
+        void loadMoreLog()
+      }
+    })
   }, [logEnded, loading, loadMoreLog, updateWindow])
+
+  // Cancel a pending scroll rAF on unmount.
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== undefined) cancelAnimationFrame(scrollRafRef.current)
+    }
+  }, [])
 
   // Recompute the render window whenever the rows/offsets change (appends,
   // expansions, drag-resize) or the tab becomes visible again (the container
@@ -460,8 +466,8 @@ export function GitView(props: TabComponentProps): ReactNode {
     updateWindow()
   }, [updateWindow, visible])
 
-  // Fill the tab: keep fetching while the log is shorter than the viewport
-  // (no button needed — the list grows until it fills the panel or history
+  // Fill the tab: keep fetching while the log is shorter than a few viewports
+  // (no button needed — the list grows until it has room to scroll or history
   // ends). GATED on `visible`: under display:none the container reports
   // scrollHeight = clientHeight = 0, so without this check the effect would
   // load every remaining batch while the user is on another tab.
@@ -469,7 +475,7 @@ export function GitView(props: TabComponentProps): ReactNode {
     if (!visible) return
     const el = listRef.current
     if (el === null || loading || logEnded || loadingMoreRef.current) return
-    if (el.scrollHeight - el.clientHeight < 80) void loadMoreLog()
+    if (el.scrollHeight - el.clientHeight < el.clientHeight * LOAD_AHEAD_VH) void loadMoreLog()
   }, [visible, logEntries.length, logEnded, loading, loadMoreLog])
 
   /** Toggle a commit's changed-file list; click again to collapse. */
