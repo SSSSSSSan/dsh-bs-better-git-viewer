@@ -206,6 +206,12 @@ export function GitView(props: TabComponentProps): ReactNode {
     end = Math.min(end, rows.length)
     setWindowRange(prev => (prev.start === start && prev.end === end ? prev : { start, end }))
   }, [rows.length])
+  // updateWindow changes identity whenever rows.length changes; callers that
+  // must invoke it WITHOUT retriggering (loadAll) go through this ref, so a
+  // batch append can never re-run the loadAll effect (that dependency loop
+  // reset the list to page 1 on every growth -> endless "加载中…").
+  const updateWindowRef = useRef(updateWindow)
+  updateWindowRef.current = updateWindow
 
   // Remember the user's repo selection per session+cwd; a remembered root
   // that is gone (excluded / deleted / different workspace) falls back to
@@ -268,7 +274,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       setCommitDetail(null)
       setFileDiff(null)
       listRef.current?.scrollTo(0, 0)
-      updateWindow() // scrollTo doesn't fire a scroll event — recompute manually
+      updateWindowRef.current() // scrollTo fires no scroll event — recompute manually
     } catch (reason) {
       if (epoch === logEpoch.current) {
         setError(reason instanceof Error ? reason.message : String(reason))
@@ -276,7 +282,7 @@ export function GitView(props: TabComponentProps): ReactNode {
     } finally {
       if (epoch === logEpoch.current) setLoading(false)
     }
-  }, [scope.sessionId, scope.cwd, rebuildLayout, updateWindow])
+  }, [scope.sessionId, scope.cwd, rebuildLayout])
 
   useEffect(() => { void loadRepos() }, [loadRepos])
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
