@@ -186,44 +186,80 @@ export function GitView(props: TabComponentProps): ReactNode {
   // detail-height change (append, expand, drag) — never on scroll.
   const [windowRange, setWindowRange] = useState({ start: 0, end: 0 })
 
-  // ── Visible-lane projection (render layer only) ─────────────────────────
-  // A lane with NO commit node anywhere in the loaded history is just a
-  // passing vertical line (a branch whose commits haven't been paged in yet).
-  // Hiding it removes visual noise without losing information. The layout
-  // rows keep EVERY lane as the memory snapshot, so the true column
-  // identities/positions survive: a lane that gains a node in a later batch
-  // reappears at its original relative position (fade-in + slide).
-  const laneHasNode = useMemo(() => {
+  // ── Visible-lane projection (render layer) ──────────────────────────────
+  // A lane is rendered only while it carries a node or merge connector within
+  // (or near) the current viewport; lanes whose commits live outside the
+  // visible window would otherwise draw as pure passing vertical lines. The
+  // layout rows keep EVERY lane as the memory snapshot, so column identities
+  // survive: a lane reappears at its original relative position when its node
+  // scrolls into view. The set GROWS immediately as node columns scroll in
+  // (nodes must never vanish mid-scroll) and is PRUNED back to the window
+  // after scrolling stops (debounced) — the slide/fade plays on the prune.
+  const rowsRef = useRef(rows)
+  rowsRef.current = rows
+  const windowRangeRef = useRef(windowRange)
+  windowRangeRef.current = windowRange
+  const [visibleColumns, setVisibleColumns] = useState<number[]>([])
+  const [lanesAnimating, setLanesAnimating] = useState(false)
+  const lanesKey = visibleColumns.join(',')
+  const pruneFlag = useRef(false)
+  // One-shot fade/slide after a PRUNE (scroll stopped); a grow (a node column
+  // scrolling into view) must not animate mid-scroll.
+  useEffect(() => {
+    if (!pruneFlag.current) return
+    pruneFlag.current = false
+    setLanesAnimating(true)
+    const t = window.setTimeout(() => setLanesAnimating(false), 320)
+    return () => window.clearTimeout(t)
+  }, [lanesKey])
+  const pruneTimer = useRef<number | undefined>(undefined)
+
+  /** Columns carrying a node or merge cell in rows [from, to). */
+  const windowLaneColumns = useCallback((from: number, to: number): number[] => {
     const has: boolean[] = []
-    for (const row of rows) {
-      for (let j = 0; j < row.cells.length; j++) {
-        if (row.cells[j] === 'node') has[j] = true
+    const hi = Math.min(to, rowsRef.current.length)
+    for (let i = Math.max(0, from); i < hi; i++) {
+      const cells = rowsRef.current[i]!.cells
+      for (let j = 0; j < cells.length; j++) {
+        if (cells[j] === 'node' || cells[j] === 'merge') has[j] = true
       }
     }
-    return has
-  }, [rows])
-  const visibleColumns = useMemo(() => {
     const cols: number[] = []
-    for (let j = 0; j < laneHasNode.length; j++) {
-      if (laneHasNode[j]) cols.push(j)
-    }
+    for (let j = 0; j < has.length; j++) if (has[j]) cols.push(j)
     return cols
-  }, [laneHasNode])
-  // One-shot fade-in window whenever the visible column set changes (a batch
-  // loaded a node into a previously hidden lane). Scrolling alone never
-  // triggers it — the key only changes on batch/refresh boundaries.
-  const [lanesAnimating, setLanesAnimating] = useState(false)
-  const prevLanesKey = useRef('')
-  const lanesKey = visibleColumns.join(',')
-  useEffect(() => {
-    if (prevLanesKey.current !== '' && prevLanesKey.current !== lanesKey) {
-      setLanesAnimating(true)
-      const t = window.setTimeout(() => setLanesAnimating(false), 320)
-      prevLanesKey.current = lanesKey
-      return () => window.clearTimeout(t)
-    }
-    prevLanesKey.current = lanesKey
-  }, [lanesKey])
+  }, [])
+
+  /** Union the window's node columns into the visible set (no animation —
+   *  runs mid-scroll so an incoming node never disappears). */
+  const growVisibleColumns = useCallback((from: number, to: number): void => {
+    const cols = windowLaneColumns(from, to)
+    if (cols.length === 0) return
+    setVisibleColumns(prev => {
+      let changed = false
+      const next = [...prev]
+      for (const j of cols) {
+        if (!next.includes(j)) {
+          next.push(j)
+          changed = true
+        }
+      }
+      if (!changed) return prev
+      next.sort((a, b) => a - b)
+      return next
+    })
+  }, [windowLaneColumns])
+
+  /** Prune the visible set back to the window (± overscan) once scrolling
+   *  settles — this is what hides the viewport's pure passing lines. */
+  const pruneVisibleColumns = useCallback((): void => {
+    const r = windowRangeRef.current
+    const cols = windowLaneColumns(r.start - OVERSCAN, r.end + OVERSCAN)
+    setVisibleColumns(prev => {
+      if (prev.length === cols.length && prev.every((v, i) => v === cols[i])) return prev
+      pruneFlag.current = true
+      return cols
+    })
+  }, [windowLaneColumns])
   // offsets live in a ref so updateWindow (defined early, used by loadAll)
   // can read the latest offsets without recreating itself on every change.
   const offsetsRef = useRef<number[]>([])
@@ -250,8 +286,11 @@ export function GitView(props: TabComponentProps): ReactNode {
     let end = lowerBoundIndex(offs, st + vh + over)
     if (end > start && offs[end - 1]! >= st + vh + over) end -= 1
     end = Math.min(end, rows.length)
+    // Union the window's node columns in immediately — a node scrolling into
+    // view must never be hidden by a stale visible set.
+    growVisibleColumns(start, end)
     setWindowRange(prev => (prev.start === start && prev.end === end ? prev : { start, end }))
-  }, [rows.length])
+  }, [rows.length, growVisibleColumns])
   // updateWindow changes identity whenever rows.length changes; callers that
   // must invoke it WITHOUT retriggering (loadAll) go through this ref, so a
   // batch append can never re-run the loadAll effect (that dependency loop
@@ -501,13 +540,21 @@ export function GitView(props: TabComponentProps): ReactNode {
       if (el.scrollTop + el.clientHeight >= el.scrollHeight - el.clientHeight * LOAD_AHEAD_VH) {
         void loadMoreLog()
       }
+      // Scroll-stopped debounce: once the user settles, prune the visible
+      // lane set back to the window (hides pure passing lines, animates).
+      if (pruneTimer.current !== undefined) window.clearTimeout(pruneTimer.current)
+      pruneTimer.current = window.setTimeout(() => {
+        pruneTimer.current = undefined
+        pruneVisibleColumns()
+      }, 150)
     })
-  }, [logEnded, loading, loadMoreLog, updateWindow])
+  }, [logEnded, loading, loadMoreLog, updateWindow, pruneVisibleColumns])
 
-  // Cancel a pending scroll rAF on unmount.
+  // Cancel pending scroll rAF + prune timer on unmount.
   useEffect(() => {
     return () => {
       if (scrollRafRef.current !== undefined) cancelAnimationFrame(scrollRafRef.current)
+      if (pruneTimer.current !== undefined) window.clearTimeout(pruneTimer.current)
     }
   }, [])
 
@@ -793,7 +840,20 @@ function CommitGraphRow(props: {
   // (order - j) * lw, so when the visible set changes the lane slides.
   const visIndex = new Map<number, number>()
   visibleColumns.forEach((j, idx) => visIndex.set(j, idx))
-  const width = visibleColumns.length * lw
+  // A-1: the row width is the LAST VISIBLE active column's projected order
+  // + 1 (merge connectors reach their target lane, so include it). Keeps the
+  // note text pressed against the row's last visible line instead of leaving
+  // blank columns from lanes that happen to have no content in this row.
+  let rowMaxOrder = -1
+  const considerOrder = (j: number): void => {
+    const order = visIndex.get(j)
+    if (order !== undefined && order > rowMaxOrder) rowMaxOrder = order
+  }
+  for (let j = 0; j < cells.length; j++) {
+    if (cells[j] !== 'none') considerOrder(j)
+  }
+  for (const j of merges) considerOrder(j)
+  const width = (rowMaxOrder + 1) * lw
   // Ref capsules stack VERTICALLY (one per row) so every branch/tag on a
   // commit stays visible. Each chip is 14px tall with a 3px gap, so a row
   // carrying n refs is max(ROW_H, 17n − 3) tall; the SVG lane drawing grows
