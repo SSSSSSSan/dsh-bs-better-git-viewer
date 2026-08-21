@@ -77,7 +77,6 @@ export function GitView(props: TabComponentProps): ReactNode {
   const [status, setStatus] = useState<{ branch?: string; entries: GitStatusEntry[] } | null>(null)
   const [logEntries, setLogEntries] = useState<GitLogEntry[]>([])
   const [logEnded, setLogEnded] = useState(false)
-  const [logSkip, setLogSkip] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [diffView, setDiffView] = useState<{ path: string; staged: boolean; text: string } | null>(null)
@@ -102,6 +101,23 @@ export function GitView(props: TabComponentProps): ReactNode {
   const listRef = useRef<HTMLDivElement | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const loadingMoreRef = useRef(false)
+  // Paging cursor for the commit log. A REF (not state): the value is only
+  // consumed by loadMoreLog at call time, and a ref keeps a stale render
+  // closure from reading an outdated skip after a reset.
+  const logSkipRef = useRef(0)
+  // The latest log entries, mirrored into a ref so stable callbacks can read
+  // the current list without recreating themselves on every append.
+  const logEntriesRef = useRef<GitLogEntry[]>([])
+  logEntriesRef.current = logEntries
+  // Whether the tab is actually visible. Mirrored into a ref so async callbacks
+  // (loadMoreLog completing) can check the LIVE visibility instead of the
+  // render-time value they closed over.
+  const visibleRef = useRef(visible)
+  visibleRef.current = visible
+  // Epoch guard: any whole-list reset (repo switch, manual refresh, ws refresh,
+  // hash-change reload) bumps this counter; a loadMoreLog that started before
+  // the bump discards its result instead of appending stale/offset batches.
+  const logEpoch = useRef(0)
 
   // Remember the user's repo selection per session+cwd; a remembered root
   // that is gone (excluded / deleted / different workspace) falls back to
@@ -144,6 +160,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       setLoading(false)
       return
     }
+    const epoch = ++logEpoch.current
     setLoading(true)
     setError(null)
     try {
@@ -151,18 +168,21 @@ export function GitView(props: TabComponentProps): ReactNode {
         api.status(root, scope),
         api.log(root, scope, LOG_BATCH, 0),
       ])
+      if (epoch !== logEpoch.current) return // superseded by a newer reset
       setStatus(statusResult)
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
-      setLogSkip(0)
+      logSkipRef.current = 0
       setDiffView(null)
       setCommitDetail(null)
       setFileDiff(null)
       listRef.current?.scrollTo(0, 0)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
     } finally {
-      setLoading(false)
+      if (epoch === logEpoch.current) setLoading(false)
     }
   }, [scope.sessionId, scope.cwd])
 
@@ -170,30 +190,71 @@ export function GitView(props: TabComponentProps): ReactNode {
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
 
   /** Content-only refresh: status + history, keeping the selected repo,
-   *  expanded diffs and scroll position intact. */
+   *  expanded diffs and scroll position intact. Bumps the epoch so an
+   *  in-flight loadMoreLog started before it discards its result. */
   const refreshContent = useCallback(async (): Promise<void> => {
     if (currentRoot === null) return
+    const epoch = ++logEpoch.current
     try {
       const [statusResult, logResult] = await Promise.all([
         api.status(currentRoot, scope),
         api.log(currentRoot, scope, LOG_BATCH, 0),
       ])
+      if (epoch !== logEpoch.current) return
       setStatus(statusResult)
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
-      setLogSkip(0)
+      logSkipRef.current = 0
+    } catch (reason) {
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
+    }
+  }, [currentRoot, scope.sessionId, scope.cwd])
+
+  /** Refresh just the status (worktree changes don't touch .git, so the
+   *  watcher never pings for them). Kept separate from the log so returning
+   *  to the tab doesn't have to reset the history. */
+  const refreshStatus = useCallback(async (): Promise<void> => {
+    if (currentRoot === null) return
+    try {
+      const statusResult = await api.status(currentRoot, scope)
+      setStatus(statusResult)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
   }, [currentRoot, scope.sessionId, scope.cwd])
 
+  /** Reload the log only when its NEWEST commit changed (new commits, branch
+   *  moves, resets). When the tip is unchanged the loaded history stays as-is
+   *  — scroll position, expanded commit and loaded batches all survive a tab
+   *  switch, which is what makes browsing early commits of a big repo usable. */
+  const refreshLogIfChanged = useCallback(async (): Promise<void> => {
+    if (currentRoot === null) return
+    const epoch = logEpoch.current
+    try {
+      const result = await api.log(currentRoot, scope, 1, 0)
+      if (epoch !== logEpoch.current) return
+      const newest = result.entries[0]?.hashFull
+      if (newest !== logEntriesRef.current[0]?.hashFull) {
+        await loadAll(currentRoot)
+      }
+    } catch (reason) {
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
+    }
+  }, [currentRoot, scope.sessionId, scope.cwd, loadAll])
+
   // When the tab becomes visible again (returning from another tab), refresh
-  // the content without touching the selection/expansion/scroll.
+  // the repo list + status, and reload the history ONLY if its tip moved —
+  // never a blind reset (which would destroy the user's browsing position).
   useEffect(() => {
     if (!visible || currentRoot === null) return
     void loadRepos()
-    void refreshContent()
-  }, [visible, currentRoot, loadRepos, refreshContent])
+    void refreshStatus()
+    void refreshLogIfChanged()
+  }, [visible, currentRoot, loadRepos, refreshStatus, refreshLogIfChanged])
 
   // Git-change WebSocket: the host pings when .git metadata changes under the
   // session cwd (commits, stage/unstage, checkout, branch moves) — debounced,
@@ -257,17 +318,25 @@ export function GitView(props: TabComponentProps): ReactNode {
   }
 
   const loadMoreLog = async (): Promise<void> => {
-    if (currentRoot === null || logEnded || loadingMoreRef.current) return
+    // Hidden tabs are display:none — never keep fetching for them. This is the
+    // guard that stops the "fill the viewport" loop from running wild in the
+    // background (scrollHeight is 0 under display:none, so the fill condition
+    // is always true).
+    if (currentRoot === null || !visibleRef.current || logEnded || loadingMoreRef.current) return
     loadingMoreRef.current = true
     setLoadingMore(true)
-    const skip = logSkip + LOG_BATCH
+    const epoch = logEpoch.current
+    const skip = logSkipRef.current + LOG_BATCH
     try {
       const result = await api.log(currentRoot, scope, LOG_BATCH, skip)
+      if (epoch !== logEpoch.current) return // a reset happened mid-flight: drop
       setLogEntries(prev => [...prev, ...result.entries])
       setLogEnded(result.entries.length < LOG_BATCH)
-      setLogSkip(skip)
+      logSkipRef.current = skip
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
     } finally {
       loadingMoreRef.current = false
       setLoadingMore(false)
@@ -276,6 +345,7 @@ export function GitView(props: TabComponentProps): ReactNode {
 
   /** Lazy load: fetch the next batch when the user scrolls near the bottom. */
   const onListScroll = useCallback((): void => {
+    if (!visibleRef.current) return
     const el = listRef.current
     if (el === null || logEnded || loading || loadingMoreRef.current) return
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 80) {
@@ -284,12 +354,16 @@ export function GitView(props: TabComponentProps): ReactNode {
   }, [logEnded, loading, loadMoreLog])
 
   // Fill the tab: keep fetching while the log is shorter than the viewport
-  // (no button needed — the list grows until it fills the panel or history ends).
+  // (no button needed — the list grows until it fills the panel or history
+  // ends). GATED on `visible`: under display:none the container reports
+  // scrollHeight = clientHeight = 0, so without this check the effect would
+  // load every remaining batch while the user is on another tab.
   useEffect(() => {
+    if (!visible) return
     const el = listRef.current
     if (el === null || loading || logEnded || loadingMoreRef.current) return
     if (el.scrollHeight - el.clientHeight < 80) void loadMoreLog()
-  }, [logEntries.length, logEnded, loading, loadMoreLog])
+  }, [visible, logEntries.length, logEnded, loading, loadMoreLog])
 
   /** Toggle a commit's changed-file list; click again to collapse. */
   const openCommit = async (entry: GitLogEntry): Promise<void> => {
