@@ -185,17 +185,45 @@ export function GitView(props: TabComponentProps): ReactNode {
   // The window is recomputed on scroll; offsets only when rows/expansion/
   // detail-height change (append, expand, drag) — never on scroll.
   const [windowRange, setWindowRange] = useState({ start: 0, end: 0 })
-  // Lane-count snapshot of the rows currently in the render window — follows
-  // both paged loading (rows grow) and scrolling (the window moves), so the
-  // UI shows forks (+1) and merges (−1) exactly as they are browsed.
-  const windowActiveLanes = useMemo(() => {
-    let max = 0
-    for (let i = windowRange.start; i < windowRange.end && i < rows.length; i++) {
-      const a = rows[i]!.activeLanes
-      if (a > max) max = a
+
+  // ── Visible-lane projection (render layer only) ─────────────────────────
+  // A lane with NO commit node anywhere in the loaded history is just a
+  // passing vertical line (a branch whose commits haven't been paged in yet).
+  // Hiding it removes visual noise without losing information. The layout
+  // rows keep EVERY lane as the memory snapshot, so the true column
+  // identities/positions survive: a lane that gains a node in a later batch
+  // reappears at its original relative position (fade-in + slide).
+  const laneHasNode = useMemo(() => {
+    const has: boolean[] = []
+    for (const row of rows) {
+      for (let j = 0; j < row.cells.length; j++) {
+        if (row.cells[j] === 'node') has[j] = true
+      }
     }
-    return max
-  }, [rows, windowRange])
+    return has
+  }, [rows])
+  const visibleColumns = useMemo(() => {
+    const cols: number[] = []
+    for (let j = 0; j < laneHasNode.length; j++) {
+      if (laneHasNode[j]) cols.push(j)
+    }
+    return cols
+  }, [laneHasNode])
+  // One-shot fade-in window whenever the visible column set changes (a batch
+  // loaded a node into a previously hidden lane). Scrolling alone never
+  // triggers it — the key only changes on batch/refresh boundaries.
+  const [lanesAnimating, setLanesAnimating] = useState(false)
+  const prevLanesKey = useRef('')
+  const lanesKey = visibleColumns.join(',')
+  useEffect(() => {
+    if (prevLanesKey.current !== '' && prevLanesKey.current !== lanesKey) {
+      setLanesAnimating(true)
+      const t = window.setTimeout(() => setLanesAnimating(false), 320)
+      prevLanesKey.current = lanesKey
+      return () => window.clearTimeout(t)
+    }
+    prevLanesKey.current = lanesKey
+  }, [lanesKey])
   // offsets live in a ref so updateWindow (defined early, used by loadAll)
   // can read the latest offsets without recreating itself on every change.
   const offsetsRef = useRef<number[]>([])
@@ -704,10 +732,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       )}
 
       {/* ── History: commit graph (virtualized + lazy-loads) ── */}
-      <div className={css.sectionTitle}>
-        历史
-        {windowActiveLanes > 0 && <span className={css.branchTag} title="当前窗口内活跃的分支泳道数（分支 +1、合并 −1）">泳道 {windowActiveLanes}</span>}
-      </div>
+      <div className={css.sectionTitle}>历史</div>
       <div className={css.logList} ref={listRef} onScroll={onListScroll}>
         {/* Spacer carries the scrollbar; only the visible window is in the DOM. */}
         <div className={css.logSpacer} style={{ height: totalHeight }}>
@@ -724,6 +749,8 @@ export function GitView(props: TabComponentProps): ReactNode {
                   row={row}
                   currentBranch={currentBranch}
                   selected={selected}
+                  visibleColumns={visibleColumns}
+                  animating={lanesAnimating}
                   onClick={() => { void openCommit(row.commit) }}
                 />
                 {selected && commitDetailNode()}
@@ -743,19 +770,30 @@ export function GitView(props: TabComponentProps): ReactNode {
   )
 }
 
-/** One commit row: SVG lane lines + node + refs + subject. */
+/** One commit row: SVG lane lines + node + refs + subject. Renders only the
+ *  VISIBLE lanes (columns that carry at least one node somewhere in the
+ *  loaded history); node-less passing lanes are hidden. Each kept lane is
+ *  drawn at its original column x and shifted with a CSS transform to its
+ *  projected order, so a change in the visible set animates as a slide. */
 function CommitGraphRow(props: {
   row: GraphRow
   currentBranch?: string
   selected: boolean
+  visibleColumns: number[]
+  animating: boolean
   onClick: () => void
 }): ReactNode {
-  const { row, currentBranch, selected, onClick } = props
-  const { commit, lanes, cells, above, below, merges, colors } = row
+  const { row, currentBranch, selected, visibleColumns, animating, onClick } = props
+  const { commit, cells, above, below, merges, colors } = row
   const refs = parseRefs(commit.refs, currentBranch)
   const nodeLane = cells.indexOf('node')
-  const lw = laneWidth(lanes)
-  const width = lanes * lw
+  const lw = laneWidth(visibleColumns.length)
+  // Projection: lane j renders at its ORDER within visibleColumns. The g is
+  // drawn at its original column (x = j*lw + lw/2) and translated by
+  // (order - j) * lw, so when the visible set changes the lane slides.
+  const visIndex = new Map<number, number>()
+  visibleColumns.forEach((j, idx) => visIndex.set(j, idx))
+  const width = visibleColumns.length * lw
   // Ref capsules stack VERTICALLY (one per row) so every branch/tag on a
   // commit stays visible. Each chip is 14px tall with a 3px gap, so a row
   // carrying n refs is max(ROW_H, 17n − 3) tall; the SVG lane drawing grows
@@ -767,14 +805,15 @@ function CommitGraphRow(props: {
   const midY = rowH / 2
   return (
     <div
-      className={`${css.graphRow}${selected ? ' ' + css.graphRowSelected : ''}`}
+      className={`${css.graphRow}${selected ? ' ' + css.graphRowSelected : ''}${animating ? ' ' + css.laneFadeIn : ''}`}
       onClick={onClick}
       title={commit.subject}
       role="button"
     >
       <svg className={css.graphSvg} width={width} height={rowH} style={{ minWidth: width }}>
         {cells.map((cell, j) => {
-          if (cell === 'none') return null
+          const order = visIndex.get(j)
+          if (cell === 'none' || order === undefined) return null // hidden lane
           const x = j * lw + lw / 2
           const color = laneColor(colors[j] ?? j)
           const segs: ReactNode[] = []
@@ -809,12 +848,20 @@ function CommitGraphRow(props: {
               />,
             )
           }
-          return <g key={j}>{segs}</g>
+          return (
+            <g key={j} style={{ transform: `translateX(${(order - j) * lw}px)`, transition: 'transform 250ms ease' }}>
+              {segs}
+            </g>
+          )
         })}
         {nodeLane >= 0 && merges.map(j => {
           if (j === nodeLane) return null
-          const x1 = nodeLane * lw + lw / 2
-          const x2 = j * lw + lw / 2
+          const targetOrder = visIndex.get(j)
+          if (targetOrder === undefined) return null // merge target lane hidden
+          const nodeOrder = visIndex.get(nodeLane) ?? 0
+          // Connectors use the PROJECTED x positions (the lanes have slid).
+          const x1 = nodeOrder * lw + lw / 2
+          const x2 = targetOrder * lw + lw / 2
           const color = laneColor(colors[j] ?? j)
           const dirX = x2 > x1 ? 1 : -1
           const hx = x2 - dirX * MERGE_R

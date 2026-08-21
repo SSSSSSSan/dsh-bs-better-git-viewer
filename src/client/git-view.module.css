@@ -390,6 +390,22 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
+/* One-shot fade-in applied to rows right after the visible-lane set changes
+   (a batch brought a node into a previously hidden lane). Scrolling alone
+   never triggers it — the class only exists during the change window. */
+.laneFadeIn {
+  animation: dshLaneFadeIn 220ms ease;
+}
+
+@keyframes dshLaneFadeIn {
+  from {
+    opacity: 0.25;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .graphRowSelected {
   background: var(--dsw-alias-interactive-bg-active);
 }
