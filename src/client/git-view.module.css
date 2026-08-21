@@ -1,0 +1,538 @@
+/*
+ * Styled with the shell's real --dsw-alias-* semantic tokens (the same
+ * vocabulary dsh-better-sidebar's own git panel uses): label-primary/secondary/
+ * tertiary for text, bg-base/layer-N for surfaces, border-lN for hairlines,
+ * interactive-bg-* for hovers, state-* for status colors.
+ */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.repoBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  flex: none;
+}
+
+.repoIcon {
+  flex: none;
+  opacity: 0.8;
+}
+
+.repoSelect {
+  flex: 1;
+  min-width: 0;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.iconButton,
+.textButton {
+  background: transparent;
+  border: none;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  flex: none;
+}
+
+.iconButton:hover,
+.textButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.errorLine {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.statusLine {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.sectionTitle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 2px;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.branchTag {
+  font-weight: 400;
+  font-size: 11px;
+  border-radius: 8px;
+  padding: 0 6px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* A status section's rows scroll inside a height cap (已暂存 / 未暂存 can
+   carry thousands of entries; without the cap they'd push 历史 out of view). */
+.statusList {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.statusRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.statusBadge {
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.statusBadge[data-xy^='?'] {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.pathButton {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  border: none;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.pathButton:hover {
+  color: var(--dsw-alias-brand-primary);
+}
+
+.diffDot {
+  margin-left: 6px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.diffBox {
+  margin: 4px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  overflow: hidden;
+  flex: none;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.diffHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: var(--dsw-alias-bg-layer-2);
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+
+.diffPath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+}
+
+.diffEmpty {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.diffBlock {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  min-height: 0;
+}
+
+.diffResize {
+  position: relative;
+  flex: none;
+  height: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.diffResizeGrip {
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--dsw-alias-border-l3);
+  transition: background 0.12s ease;
+}
+
+.diffResize:hover .diffResizeGrip,
+.diffResize:active .diffResizeGrip {
+  background: var(--dsw-alias-brand-primary);
+}
+
+.diffScroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.diffFile {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--dsw-alias-bg-layer-2);
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+
+.diffFilePath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.diffFileOld {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  flex: none;
+}
+
+.diffFileTag {
+  flex: none;
+  font-size: 10px;
+  line-height: 14px;
+  border-radius: 8px;
+  padding: 0 6px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.diffFileTag[data-kind='add'] {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.diffFileTag[data-kind='del'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.diffFileTag[data-kind='ren'] {
+  color: var(--dsw-alias-brand-primary);
+}
+
+.diffFileTag[data-kind='binary'] {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.diffHunk {
+  padding: 2px 8px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-layer-1);
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.diffLine {
+  display: flex;
+  padding: 0 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.diffLine:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.diffMarker {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  user-select: none;
+}
+
+.diffText {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+
+.diffLine[data-kind='add'] {
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent);
+}
+
+.diffLine[data-kind='add'] .diffMarker {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.diffLine[data-kind='del'] {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent);
+}
+
+.diffLine[data-kind='del'] .diffMarker {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.diffLine[data-kind='meta'] {
+  color: var(--dsw-alias-label-tertiary);
+  font-style: italic;
+}
+
+.commitButton {
+  border-radius: 4px;
+  border: none;
+  background: var(--dsw-alias-button-primary-fill);
+  color: var(--dsw-alias-label-primary-inverted);
+  padding: 2px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  flex: none;
+}
+
+.commitButton:hover {
+  background: var(--dsw-alias-button-primary-hover);
+}
+
+.commitButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.logList {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+}
+
+.graphRow {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.graphRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.graphRowSelected {
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+.graphSvg {
+  display: block;
+  flex: none;
+  overflow: visible;
+}
+
+.graphBody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+/* Branch/tag capsules stack VERTICALLY (one per row) instead of a single
+   truncated horizontal line: a commit carrying many refs shows them all.
+   The row height grows to fit the stack (see CommitGraphRow). */
+.graphRefs {
+  flex: none;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.refChip,
+.refChipHead {
+  flex: none;
+  font-size: 10px;
+  line-height: 14px;
+  border-radius: 8px;
+  padding: 0 5px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.refChipHead {
+  background: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary-inverted);
+}
+
+.logSubject {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+}
+
+.logMeta {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  flex: none;
+}
+
+.commitDetail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 0 8px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  overflow: hidden;
+  flex: none;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+/* The file list scrolls inside the (height-capped) commit detail box. */
+.commitDetailBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.commitDetailHash {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  flex: none;
+}
+
+.commitDetailSubject {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+}
+
+.commitFileRow {
+  display: flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.commitFileRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.commitFileDiff {
+  margin: 2px 8px 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.excludesPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  min-width: 240px;
+  max-width: 360px;
+}
+
+.excludesHint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.excludesHint code {
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--dsw-alias-label-primary);
+}
+
+.excludesTextarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 120px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.excludesTextarea:focus {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.excludesTextarea::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.excludesButtons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

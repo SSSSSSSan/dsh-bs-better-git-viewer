@@ -1,0 +1,4 @@
+# dsh-bs-better-git-viewer bundle patch (declared via dsh.bundle.patch).
+- insert:
+    - id: bs-git-viewer
+      name: 'dsh-bs-better-git-viewer'
