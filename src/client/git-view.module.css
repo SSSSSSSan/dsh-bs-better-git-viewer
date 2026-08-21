@@ -352,6 +352,28 @@
   min-height: 0;
   overflow-y: auto;
   padding: 0 8px 8px;
+  /* Virtualized list: the content height grows per batch, so a visible
+     scrollbar thumb jumps on every append. Hide it — wheel, touch and
+     keyboard scrolling still work. */
+  scrollbar-width: none;
+}
+
+.logList::-webkit-scrollbar {
+  display: none;
+}
+
+/* Virtualized commit list: a relative spacer of the full content height
+   drives the scrollbar; each rendered row is absolutely positioned at its
+   cumulative offset (translateY for compositor-friendly scrolling). */
+.logSpacer {
+  position: relative;
+}
+
+.logVirtualRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
 }
 
 .graphRow {
@@ -366,6 +388,36 @@
 
 .graphRow:hover {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* Per-lane enter/exit fades, applied to a lane's <g> only during a
+   scroll-stopped prune: an exiting lane fades out in place (the survivors
+   slide around it), a lane added by the same prune fades in. Mid-scroll
+   grows never animate — they snap into place. */
+.laneEnter {
+  animation: dshLaneEnter 200ms ease;
+}
+
+.laneExit {
+  animation: dshLaneExit 220ms ease forwards;
+}
+
+@keyframes dshLaneEnter {
+  from {
+    opacity: 0.25;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dshLaneExit {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
 }
 
 .graphRowSelected {

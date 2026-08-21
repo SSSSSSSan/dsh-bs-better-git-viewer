@@ -19,22 +19,65 @@ import { IconBranchOutline16, IconRefreshOutline16 } from '@deepseek-ai/dsh-clie
 import type { TabComponentProps } from 'dsh-better-sidebar/client/service'
 import { api } from './api.ts'
 import type { GitLogEntry, GitRepo, GitStatusEntry } from './api.ts'
-import { laneColor, layoutGraph, parseRefs } from './graph.ts'
-import type { GraphRow } from './graph.ts'
+import { createGraphLayout, laneColor, parseRefs } from './graph.ts'
+import type { GraphLayoutWalker, GraphRow } from './graph.ts'
 import { DiffBlock } from './DiffBlock.tsx'
 import css from './git-view.module.css'
 
 const LOG_BATCH = 100
+/** Hard cap on loaded log entries: virtualization keeps the DOM small, but
+ *  the entries array + graph rows + offsets still grow — this bounds memory
+ *  on truly enormous histories (50k entries ≈ a few MB of raw data). */
+const LOG_MAX_ENTRIES = 50_000
 const ROW_H = 22
 const LANE_W = 12
 const NODE_R = 4
 /** Radius of the rounded corner where a merge connector meets a lane. */
 const MERGE_R = 4
+/** Extra commit rows rendered above/below the viewport window. */
+const OVERSCAN = 12
+/** Lane slide (prune) transition duration — matches the <g> transform
+ *  transition and the row-width transition. */
+const SLIDE_MS = 250
+/** Exit/enter fade duration for lanes removed/added by a scroll-stopped prune. */
+const LANE_EXIT_MS = 220
+/** Prune retention band: columns with a node inside window ± 2×OVERSCAN stay
+ *  rendered (hysteresis — oscillating around the boundary does not pop lanes). */
+const PRUNE_OVERSCAN = OVERSCAN * 2
+/** Load the next batch when the remaining scrollable content is less than
+ *  this many viewport heights — loads AHEAD of the bottom so a long downward
+ *  scroll never stalls waiting for the network (80px was too late). */
+const LOAD_AHEAD_VH = 3
+/** Bottom margin of the commit-detail box (mirrors .commitDetail's 8px). */
+const DETAIL_MARGIN_BOTTOM = 8
 
 /** Commit-detail panel sizing (drag-resizable, same pattern as the diff block). */
 const DETAIL_DEFAULT_HEIGHT = 320
 const DETAIL_MIN_HEIGHT = 120
 const DETAIL_MAX_HEIGHT = 560
+
+/** Height of one commit row block: the graph row itself (ROW_H, taller when
+ *  refs stack vertically). Shared between rendering and the virtualization
+ *  offsets so the two can never disagree. */
+function rowHeightOf(row: GraphRow, currentBranch?: string): number {
+  const refs = parseRefs(row.commit.refs, currentBranch)
+  const refsStackH = refs.length > 0 ? refs.length * 17 - 3 : 0
+  return Math.max(ROW_H, refsStackH)
+}
+
+/** First index in `offsets` whose cumulative offset exceeds `value`
+ *  (offsets.length when `value` is past the end). Row `j` starts at
+ *  offsets[j], so rows in [start, end) cover the range (startVal, endVal]. */
+function lowerBoundIndex(offsets: number[], value: number): number {
+  let lo = 0
+  let hi = offsets.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (offsets[mid]! <= value) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
 
 /** Lane spacing is FIXED (small): dynamic widths moved the same lane's line
  *  between rows when the lane count crossed a threshold, breaking the
@@ -77,7 +120,6 @@ export function GitView(props: TabComponentProps): ReactNode {
   const [status, setStatus] = useState<{ branch?: string; entries: GitStatusEntry[] } | null>(null)
   const [logEntries, setLogEntries] = useState<GitLogEntry[]>([])
   const [logEnded, setLogEnded] = useState(false)
-  const [logSkip, setLogSkip] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [diffView, setDiffView] = useState<{ path: string; staged: boolean; text: string } | null>(null)
@@ -102,6 +144,243 @@ export function GitView(props: TabComponentProps): ReactNode {
   const listRef = useRef<HTMLDivElement | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const loadingMoreRef = useRef(false)
+  // Paging cursor for the commit log. A REF (not state): the value is only
+  // consumed by loadMoreLog at call time, and a ref keeps a stale render
+  // closure from reading an outdated skip after a reset.
+  const logSkipRef = useRef(0)
+  // The latest log entries, mirrored into a ref so stable callbacks can read
+  // the current list without recreating themselves on every append.
+  const logEntriesRef = useRef<GitLogEntry[]>([])
+  logEntriesRef.current = logEntries
+  // Whether the tab is actually visible. Mirrored into a ref so async callbacks
+  // (loadMoreLog completing) can check the LIVE visibility instead of the
+  // render-time value they closed over.
+  const visibleRef = useRef(visible)
+  visibleRef.current = visible
+  // Epoch guard: any whole-list reset (repo switch, manual refresh, ws refresh,
+  // hash-change reload) bumps this counter; a loadMoreLog that started before
+  // the bump discards its result instead of appending stale/offset batches.
+  const logEpoch = useRef(0)
+  // Monotonic id of the most recent loadAll — owns the `loading` flag. A
+  // superseded loadAll must not clear `loading` (a newer one owns it), but a
+  // loadAll invalidated by an epoch bump before completion must not leave it
+  // stuck either: both cases settle on "the latest loadAll decides".
+  const loadIdRef = useRef(0)
+  // The root the loaded history belongs to. loadAll does not otherwise know
+  // whether its `root` differs from what is currently displayed — this ref
+  // detects real repo switches (vs. tip-changed reloads of the same repo).
+  const lastRootRef = useRef<string | null>(null)
+  // Incremental commit-graph layout: the walker keeps the lane state across
+  // appends, so loading another batch costs O(batch) instead of re-laying-out
+  // the whole history. `rows` mirrors logEntries 1:1 (row i renders entry i).
+  const layoutRef = useRef<GraphLayoutWalker | null>(null)
+  const [rows, setRows] = useState<GraphRow[]>([])
+  /** Rebuild the graph walker for a full entry list (repo switch, refresh,
+   *  branch change). Replaying the SAME sequence (same branch, same tip hash,
+   *  same length) reuses the walker's cached rows — O(1) instead of re-running
+   *  the lane state machine over every loaded commit. */
+  const rebuildLayout = useCallback((entries: GitLogEntry[], branch: string | undefined): void => {
+    const existing = layoutRef.current
+    if (
+      existing !== null
+      && existing.branch === branch
+      && existing.allRows.length === entries.length
+      && existing.allRows[0]?.commit.hashFull === entries[0]?.hashFull
+    ) {
+      setRows(existing.allRows.slice())
+      return
+    }
+    layoutRef.current = createGraphLayout(branch)
+    setRows(layoutRef.current.append(entries))
+  }, [])
+
+  // ── Virtualized commit list ─────────────────────────────────────────────
+  // Only the commit rows inside the viewport (± overscan) are rendered; a
+  // spacer of the total content height drives the scrollbar. Rows have
+  // VARIABLE heights (refs stack vertically; an expanded commit adds its
+  // detail box), so a cumulative-offsets array maps row index -> y position.
+  // The window is recomputed on scroll; offsets only when rows/expansion/
+  // detail-height change (append, expand, drag) — never on scroll.
+  const [windowRange, setWindowRange] = useState({ start: 0, end: 0 })
+
+  // ── Visible-lane projection (render layer) ──────────────────────────────
+  // A lane is rendered only while it carries a node or merge connector within
+  // (or near) the current viewport; lanes whose commits live outside the
+  // visible window would otherwise draw as pure passing vertical lines. The
+  // layout rows keep EVERY lane as the memory snapshot, so column identities
+  // survive: a lane reappears at its original relative position when its node
+  // scrolls into view. The set GROWS immediately as node columns scroll in
+  // (nodes must never vanish mid-scroll) and is PRUNED back to the window
+  // after scrolling stops (debounced) — the slide/fade plays on the prune.
+  const rowsRef = useRef(rows)
+  rowsRef.current = rows
+  const windowRangeRef = useRef(windowRange)
+  windowRangeRef.current = windowRange
+  const [visibleColumns, setVisibleColumns] = useState<number[]>([])
+  // Prune animation state: `pruneSliding` gates the lane/width transitions
+  // (only a scroll-stopped PRUNE may animate; grows snap into place so lanes
+  // never lag the scroll). `exitingLanes` are lanes pruned away that fade out
+  // in place; `pruneAdded` are lanes entering during the same prune (fade in).
+  const [pruneSliding, setPruneSliding] = useState(false)
+  const [exitingLanes, setExitingLanes] = useState<number[]>([])
+  const [pruneAdded, setPruneAdded] = useState<number[]>([])
+  // `settling` gates the row-WIDTH transition: the width only shrinks when the
+  // exiting lanes unmount (LANE_EXIT_MS), so it must stay transitionable past
+  // the 250ms transform slide until that shrink has finished.
+  const [settling, setSettling] = useState(false)
+  // Mirrors for decision-making inside handlers (handlers run between renders,
+  // so the refs always hold the committed values).
+  const visibleColumnsRef = useRef(visibleColumns)
+  visibleColumnsRef.current = visibleColumns
+  const pruneSlidingRef = useRef(pruneSliding)
+  pruneSlidingRef.current = pruneSliding
+  const settlingRef = useRef(settling)
+  settlingRef.current = settling
+  const exitingLanesRef = useRef(exitingLanes)
+  exitingLanesRef.current = exitingLanes
+  const pruneAddedRef = useRef(pruneAdded)
+  pruneAddedRef.current = pruneAdded
+  const slideTimer = useRef<number | undefined>(undefined)
+  const settleTimer = useRef<number | undefined>(undefined)
+  const exitTimer = useRef<number | undefined>(undefined)
+
+  /** Commit one visible-set change. `fromPrune` decides whether it animates:
+   *  only a scroll-stopped PRUNE may slide lanes / fade exits; every grow (a
+   *  node scrolling into view, a batch append, a tab reveal) snaps into place.
+   *  A grow that lands inside a prune animation window cancels that animation
+   *  (the user started scrolling again). */
+  const applyVisibleSet = useCallback((next: number[], fromPrune: boolean): void => {
+    const prev = visibleColumnsRef.current
+    if (prev.length === next.length && prev.every((v, i) => v === next[i])) return
+    const removed = prev.filter(j => !next.includes(j))
+    const added = next.filter(j => !prev.includes(j))
+    if (fromPrune) {
+      if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+      if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+      if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
+      setPruneSliding(true)
+      setSettling(true)
+      setExitingLanes(removed)
+      setPruneAdded(added)
+      slideTimer.current = window.setTimeout(() => setPruneSliding(false), SLIDE_MS)
+      // The width shrink only starts when the exits unmount, so the settle
+      // window outlives the transform slide.
+      settleTimer.current = window.setTimeout(() => setSettling(false), LANE_EXIT_MS + SLIDE_MS)
+      exitTimer.current = window.setTimeout(() => {
+        setExitingLanes([])
+        setPruneAdded([])
+      }, LANE_EXIT_MS)
+    } else {
+      if (pruneSlidingRef.current) {
+        setPruneSliding(false)
+        if (slideTimer.current !== undefined) {
+          window.clearTimeout(slideTimer.current)
+          slideTimer.current = undefined
+        }
+      }
+      if (settlingRef.current) {
+        setSettling(false)
+        if (settleTimer.current !== undefined) {
+          window.clearTimeout(settleTimer.current)
+          settleTimer.current = undefined
+        }
+      }
+      if (exitingLanesRef.current.length > 0 || pruneAddedRef.current.length > 0) {
+        setExitingLanes([])
+        setPruneAdded([])
+        if (exitTimer.current !== undefined) {
+          window.clearTimeout(exitTimer.current)
+          exitTimer.current = undefined
+        }
+      }
+    }
+    setVisibleColumns(next)
+  }, [])
+  const pruneTimer = useRef<number | undefined>(undefined)
+
+  /** Columns carrying a node or merge cell in rows [from, to). */
+  const windowLaneColumns = useCallback((from: number, to: number): number[] => {
+    const has: boolean[] = []
+    const hi = Math.min(to, rowsRef.current.length)
+    for (let i = Math.max(0, from); i < hi; i++) {
+      const cells = rowsRef.current[i]!.cells
+      for (let j = 0; j < cells.length; j++) {
+        if (cells[j] === 'node' || cells[j] === 'merge') has[j] = true
+      }
+    }
+    const cols: number[] = []
+    for (let j = 0; j < has.length; j++) if (has[j]) cols.push(j)
+    return cols
+  }, [])
+
+  /** Union the window's node columns into the visible set (no animation —
+   *  runs mid-scroll so an incoming node never disappears; lanes snap). */
+  const growVisibleColumns = useCallback((from: number, to: number): void => {
+    const cols = windowLaneColumns(from, to)
+    if (cols.length === 0) return
+    const prev = visibleColumnsRef.current
+    const next = [...prev]
+    let changed = false
+    for (const j of cols) {
+      if (!next.includes(j)) {
+        next.push(j)
+        changed = true
+      }
+    }
+    if (!changed) return
+    next.sort((a, b) => a - b)
+    applyVisibleSet(next, false)
+  }, [windowLaneColumns, applyVisibleSet])
+
+  /** Prune the visible set back to the window (± PRUNE_OVERSCAN) once
+   *  scrolling settles — this is what hides the viewport's pure passing
+   *  lines. The prune is the ONLY change that animates (slide + per-lane
+   *  exit/enter fades). */
+  const pruneVisibleColumns = useCallback((): void => {
+    const r = windowRangeRef.current
+    const cols = windowLaneColumns(r.start - PRUNE_OVERSCAN, r.end + PRUNE_OVERSCAN)
+    applyVisibleSet(cols, true)
+  }, [windowLaneColumns, applyVisibleSet])
+  // offsets live in a ref so updateWindow (defined early, used by loadAll)
+  // can read the latest offsets without recreating itself on every change.
+  const offsetsRef = useRef<number[]>([])
+
+  /** Recompute which rows must be in the DOM for the current scroll position. */
+  const updateWindow = useCallback((): void => {
+    const el = listRef.current
+    const offs = offsetsRef.current
+    if (el === null || offs.length === 0) return
+    // Hidden tabs report clientHeight = 0: computing the window there would
+    // degenerate it to a 1-2 row band (and pollute the visible set). Skip.
+    if (!visibleRef.current) return
+    const st = Math.max(0, el.scrollTop)
+    const vh = Math.max(0, el.clientHeight)
+    const over = OVERSCAN * ROW_H
+    // First row whose bottom edge (offsets[i+1]) is past the window top; the
+    // lb-1 accounts for the row whose top is inside the overscan but whose
+    // bottom still crosses it. Clamped so an out-of-range scrollTop (browser
+    // clamps it anyway) can never produce an empty window.
+    const start = Math.min(
+      Math.max(0, lowerBoundIndex(offs, st - over) - 1),
+      Math.max(0, rows.length - 1),
+    )
+    // End is exclusive: the first row whose TOP is at/below the window bottom
+    // (a row exactly touching the bottom edge renders nothing extra, keeping
+    // the window identical to the strict [top < bottom) reference).
+    let end = lowerBoundIndex(offs, st + vh + over)
+    if (end > start && offs[end - 1]! >= st + vh + over) end -= 1
+    end = Math.min(end, rows.length)
+    // Union the window's node columns in immediately — a node scrolling into
+    // view must never be hidden by a stale visible set.
+    growVisibleColumns(start, end)
+    setWindowRange(prev => (prev.start === start && prev.end === end ? prev : { start, end }))
+  }, [rows.length, growVisibleColumns])
+  // updateWindow changes identity whenever rows.length changes; callers that
+  // must invoke it WITHOUT retriggering (loadAll) go through this ref, so a
+  // batch append can never re-run the loadAll effect (that dependency loop
+  // reset the list to page 1 on every growth -> endless "加载中…").
+  const updateWindowRef = useRef(updateWindow)
+  updateWindowRef.current = updateWindow
 
   // Remember the user's repo selection per session+cwd; a remembered root
   // that is gone (excluded / deleted / different workspace) falls back to
@@ -137,13 +416,54 @@ export function GitView(props: TabComponentProps): ReactNode {
     }
   }, [scope.sessionId, scope.cwd])
 
+  /** Clear the lane projection for a whole-list reset (repo switch, manual
+   *  refresh): a fresh browse starts from an empty visible set, so no stale
+   *  lanes from the previous scroll position linger. */
+  const resetLaneProjection = (): void => {
+    if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+    if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+    if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
+    setPruneSliding(false)
+    setSettling(false)
+    setExitingLanes([])
+    setPruneAdded([])
+    setVisibleColumns([])
+  }
+
   const loadAll = useCallback(async (root: string | null): Promise<void> => {
+    resetLaneProjection()
     if (root === null) {
       setStatus(null)
       setLogEntries([])
+      layoutRef.current = null
+      setRows([])
       setLoading(false)
+      lastRootRef.current = null
       return
     }
+    // A repo switch must not leave the PREVIOUS repo's rows clickable while
+    // the new log loads: clearing them up-front shows 加载中… instead of the
+    // wrong repo's history, and a stale click becomes a no-op (see openCommit).
+    // A reload of the SAME root (tip moved / manual refresh) keeps the current
+    // rows until the fresh batch arrives (non-destructive). Status is NOT
+    // cleared: doing so would flip the branch mid-load and re-trigger the
+    // branch-change effect for no benefit.
+    const rootChanged = root !== lastRootRef.current
+    lastRootRef.current = root
+    if (rootChanged) {
+      setLogEntries([])
+      setRows([])
+      setDiffView(null)
+      setCommitDetail(null)
+      setFileDiff(null)
+    }
+    // `loadId` owns this invocation: only the LATEST loadAll may apply its
+    // data / clear `loading` / surface its error. logEpoch is bumped too (an
+    // in-flight loadMoreLog must drop), but the branch-change effect ALSO
+    // bumps logEpoch — that must not discard this batch (it is the current
+    // repo's authoritative load), which is why the guard is loadId, not epoch.
+    const loadId = ++loadIdRef.current
+    ++logEpoch.current
     setLoading(true)
     setError(null)
     try {
@@ -151,49 +471,80 @@ export function GitView(props: TabComponentProps): ReactNode {
         api.status(root, scope),
         api.log(root, scope, LOG_BATCH, 0),
       ])
+      if (loadId !== loadIdRef.current) return // superseded by a newer loadAll
       setStatus(statusResult)
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
-      setLogSkip(0)
-      setDiffView(null)
-      setCommitDetail(null)
-      setFileDiff(null)
+      logSkipRef.current = 0
+      rebuildLayout(logResult.entries, statusResult.branch)
       listRef.current?.scrollTo(0, 0)
+      updateWindowRef.current() // scrollTo fires no scroll event — recompute manually
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      if (loadId === loadIdRef.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
     } finally {
-      setLoading(false)
+      if (loadId === loadIdRef.current) setLoading(false)
     }
-  }, [scope.sessionId, scope.cwd])
+  }, [scope.sessionId, scope.cwd, rebuildLayout])
 
   useEffect(() => { void loadRepos() }, [loadRepos])
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
 
-  /** Content-only refresh: status + history, keeping the selected repo,
-   *  expanded diffs and scroll position intact. */
-  const refreshContent = useCallback(async (): Promise<void> => {
+  /** Refresh just the status (worktree changes don't touch .git, so the
+   *  watcher never pings for them). Kept separate from the log so returning
+   *  to the tab doesn't have to reset the history. */
+  const refreshStatus = useCallback(async (): Promise<void> => {
     if (currentRoot === null) return
     try {
-      const [statusResult, logResult] = await Promise.all([
-        api.status(currentRoot, scope),
-        api.log(currentRoot, scope, LOG_BATCH, 0),
-      ])
+      const statusResult = await api.status(currentRoot, scope)
       setStatus(statusResult)
-      setLogEntries(logResult.entries)
-      setLogEnded(logResult.entries.length < LOG_BATCH)
-      setLogSkip(0)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
   }, [currentRoot, scope.sessionId, scope.cwd])
 
+  /** Reload the log only when its NEWEST commit changed (new commits, branch
+   *  moves, resets). When the tip is unchanged the loaded history stays as-is
+   *  — scroll position, expanded commit and loaded batches all survive a tab
+   *  switch, which is what makes browsing early commits of a big repo usable. */
+  const refreshLogIfChanged = useCallback(async (): Promise<void> => {
+    if (currentRoot === null) return
+    const epoch = logEpoch.current
+    try {
+      const result = await api.log(currentRoot, scope, 1, 0)
+      if (epoch !== logEpoch.current) return
+      const newest = result.entries[0]?.hashFull
+      if (newest !== logEntriesRef.current[0]?.hashFull) {
+        await loadAll(currentRoot)
+      }
+    } catch (reason) {
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
+    }
+  }, [currentRoot, scope.sessionId, scope.cwd, loadAll])
+
+  /** WS-triggered refresh (.git changed). NON-destructive: refresh the status
+   *  and reload the log only if its tip moved (new commits / checkout). A
+   *  stage/unstage or an unrelated fs event must never wipe the user's scroll
+   *  position while they are browsing deep history — that reset was the other
+   *  half of the "scroll jumps back to the top" behaviour. */
+  const refreshContent = useCallback(async (): Promise<void> => {
+    if (currentRoot === null) return
+    await refreshStatus()
+    await refreshLogIfChanged()
+  }, [currentRoot, refreshStatus, refreshLogIfChanged])
+
   // When the tab becomes visible again (returning from another tab), refresh
-  // the content without touching the selection/expansion/scroll.
+  // the repo list + status, and reload the history ONLY if its tip moved —
+  // never a blind reset (which would destroy the user's browsing position).
   useEffect(() => {
     if (!visible || currentRoot === null) return
     void loadRepos()
-    void refreshContent()
-  }, [visible, currentRoot, loadRepos, refreshContent])
+    void refreshStatus()
+    void refreshLogIfChanged()
+  }, [visible, currentRoot, loadRepos, refreshStatus, refreshLogIfChanged])
 
   // Git-change WebSocket: the host pings when .git metadata changes under the
   // session cwd (commits, stage/unstage, checkout, branch moves) — debounced,
@@ -257,43 +608,107 @@ export function GitView(props: TabComponentProps): ReactNode {
   }
 
   const loadMoreLog = async (): Promise<void> => {
-    if (currentRoot === null || logEnded || loadingMoreRef.current) return
+    // Hidden tabs are display:none — never keep fetching for them. This is the
+    // guard that stops the "fill the viewport" loop from running wild in the
+    // background (scrollHeight is 0 under display:none, so the fill condition
+    // is always true).
+    if (currentRoot === null || !visibleRef.current || logEnded || loadingMoreRef.current) return
     loadingMoreRef.current = true
     setLoadingMore(true)
-    const skip = logSkip + LOG_BATCH
+    const epoch = logEpoch.current
+    const skip = logSkipRef.current + LOG_BATCH
     try {
       const result = await api.log(currentRoot, scope, LOG_BATCH, skip)
-      setLogEntries(prev => [...prev, ...result.entries])
-      setLogEnded(result.entries.length < LOG_BATCH)
-      setLogSkip(skip)
+      if (epoch !== logEpoch.current) return // a reset happened mid-flight: drop
+      // Enforce the hard cap: never accumulate more than LOG_MAX_ENTRIES, and
+      // mark the log ended once the cap is hit (deeper history then requires a
+      // narrower query — out of scope for the lazy pager).
+      const before = logEntriesRef.current.length
+      const take = before >= LOG_MAX_ENTRIES ? [] : result.entries.slice(0, LOG_MAX_ENTRIES - before)
+      // Append both the entries and their graph rows — the walker only lays
+      // out the NEW batch, so deep browsing stays O(batch) per page.
+      setLogEntries(prev => [...prev, ...take])
+      const newRows = layoutRef.current?.append(take) ?? []
+      setRows(prev => [...prev, ...newRows])
+      setLogEnded(take.length < LOG_BATCH || before + take.length >= LOG_MAX_ENTRIES)
+      logSkipRef.current = skip
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      if (epoch === logEpoch.current) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
     } finally {
       loadingMoreRef.current = false
       setLoadingMore(false)
     }
   }
 
-  /** Lazy load: fetch the next batch when the user scrolls near the bottom. */
+  /** Lazy load + virtual window: on every scroll, recompute which rows are
+   *  visible and fetch the next batch when the remaining content is less than
+   *  a few viewports (loads AHEAD of the bottom so a long downward scroll
+   *  never stalls waiting for the network). rAF-throttled: a fast scroll must
+   *  not re-render the window rows more than once per frame. */
+  const scrollRafRef = useRef<number | undefined>(undefined)
   const onListScroll = useCallback((): void => {
-    const el = listRef.current
-    if (el === null || logEnded || loading || loadingMoreRef.current) return
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 80) {
-      void loadMoreLog()
-    }
-  }, [logEnded, loading, loadMoreLog])
+    if (!visibleRef.current) return
+    if (scrollRafRef.current !== undefined) return
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = undefined
+      updateWindow()
+      const el = listRef.current
+      if (el === null || logEnded || loading || loadingMoreRef.current) return
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - el.clientHeight * LOAD_AHEAD_VH) {
+        void loadMoreLog()
+      }
+      // Scroll-stopped debounce: once the user settles, prune the visible
+      // lane set back to the window (hides pure passing lines, animates).
+      if (pruneTimer.current !== undefined) window.clearTimeout(pruneTimer.current)
+      pruneTimer.current = window.setTimeout(() => {
+        pruneTimer.current = undefined
+        pruneVisibleColumns()
+      }, 150)
+    })
+  }, [logEnded, loading, loadMoreLog, updateWindow, pruneVisibleColumns])
 
-  // Fill the tab: keep fetching while the log is shorter than the viewport
-  // (no button needed — the list grows until it fills the panel or history ends).
+  // Cancel pending scroll rAF + prune/slide/exit timers on unmount.
   useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== undefined) cancelAnimationFrame(scrollRafRef.current)
+      if (pruneTimer.current !== undefined) window.clearTimeout(pruneTimer.current)
+      if (slideTimer.current !== undefined) window.clearTimeout(slideTimer.current)
+      if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
+      if (exitTimer.current !== undefined) window.clearTimeout(exitTimer.current)
+    }
+  }, [])
+
+  // Recompute the render window whenever the rows/offsets change (appends,
+  // expansions, drag-resize) or the tab becomes visible again (the container
+  // was display:none, so its clientHeight was 0 while hidden). `rows` is a
+  // dependency BY IDENTITY, not just rows.length: a repo switch to another
+  // repo with the same number of loaded rows would otherwise keep the stale
+  // window/lane projection (no lanes for the new history).
+  useEffect(() => {
+    updateWindow()
+  }, [updateWindow, visible, rows])
+
+  // Fill the tab: keep fetching while the log is shorter than a few viewports
+  // (no button needed — the list grows until it has room to scroll or history
+  // ends). GATED on `visible`: under display:none the container reports
+  // scrollHeight = clientHeight = 0, so without this check the effect would
+  // load every remaining batch while the user is on another tab.
+  useEffect(() => {
+    if (!visible) return
     const el = listRef.current
     if (el === null || loading || logEnded || loadingMoreRef.current) return
-    if (el.scrollHeight - el.clientHeight < 80) void loadMoreLog()
-  }, [logEntries.length, logEnded, loading, loadMoreLog])
+    if (el.scrollHeight - el.clientHeight < el.clientHeight * LOAD_AHEAD_VH) void loadMoreLog()
+  }, [visible, logEntries.length, logEnded, loading, loadMoreLog])
 
   /** Toggle a commit's changed-file list; click again to collapse. */
   const openCommit = async (entry: GitLogEntry): Promise<void> => {
     if (currentRoot === null) return
+    // Ignore clicks on rows that are no longer part of the loaded history —
+    // a stale row from the previous repo lingering during a switch would run
+    // git against the NEW repo with the OLD repo's hash ("fatal: bad object").
+    if (!logEntriesRef.current.some(e => e.hashFull === entry.hashFull)) return
     if (commitDetail !== null && commitDetail.hashFull === entry.hashFull) {
       setCommitDetail(null)
       setFileDiff(null)
@@ -338,7 +753,34 @@ export function GitView(props: TabComponentProps): ReactNode {
     repos.find(repo => repo.root === root)?.name ?? (root === null ? '—' : root.slice(root.lastIndexOf('\\') + 1))
 
   const currentBranch = status?.branch
-  const rows = useMemo(() => layoutGraph(logEntries, currentBranch), [logEntries, currentBranch])
+
+  // Variable-height virtualization offsets: cumulative y positions of every
+  // loaded row (an expanded commit also contributes its detail box). Computed
+  // only when the row set / expansion / detail height changes — scrolling
+  // itself never rebuilds this array.
+  const offsets = useMemo(() => {
+    const arr = new Array<number>(rows.length + 1)
+    arr[0] = 0
+    for (let i = 0; i < rows.length; i++) {
+      let h = rowHeightOf(rows[i]!, currentBranch)
+      if (commitDetail !== null && commitDetail.hashFull === rows[i]!.commit.hashFull) {
+        h += detailHeight + DETAIL_MARGIN_BOTTOM
+      }
+      arr[i + 1] = arr[i]! + h
+    }
+    return arr
+  }, [rows, currentBranch, commitDetail, detailHeight])
+  offsetsRef.current = offsets
+  const totalHeight = offsets[rows.length] ?? 0
+
+  // The branch feeds the graph's fork rule; when it changes (checkout / reset
+  // surfaced by a status refresh) re-lay-out the whole loaded history. The
+  // epoch bump invalidates any loadMoreLog still in flight.
+  useEffect(() => {
+    if (layoutRef.current === null) return // nothing laid out yet (mount)
+    ++logEpoch.current
+    rebuildLayout(logEntriesRef.current, currentBranch)
+  }, [currentBranch, rebuildLayout])
 
   /** Drag the commit-detail resize handle to change the box height (120–560px). */
   const onDetailHandleDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
@@ -465,50 +907,137 @@ export function GitView(props: TabComponentProps): ReactNode {
         </div>
       )}
 
-      {/* ── History: commit graph (scrolls + lazy-loads) ── */}
+      {/* ── History: commit graph (virtualized + lazy-loads) ── */}
       <div className={css.sectionTitle}>历史</div>
       <div className={css.logList} ref={listRef} onScroll={onListScroll}>
-        {rows.map(row => {
-          const selected = commitDetail !== null && commitDetail.hashFull === row.commit.hashFull
-          return (
-            <Fragment key={row.commit.hashFull}>
-              <CommitGraphRow
-                row={row}
-                currentBranch={currentBranch}
-                selected={selected}
-                onClick={() => { void openCommit(row.commit) }}
-              />
-              {selected && commitDetailNode()}
-            </Fragment>
-          )
-        })}
+        {/* Spacer carries the scrollbar; only the visible window is in the DOM. */}
+        <div className={css.logSpacer} style={{ height: totalHeight }}>
+          {rows.slice(windowRange.start, windowRange.end).map((row, i) => {
+            const absIndex = windowRange.start + i
+            const selected = commitDetail !== null && commitDetail.hashFull === row.commit.hashFull
+            return (
+              <div
+                key={row.commit.hashFull}
+                className={css.logVirtualRow}
+                style={{ transform: `translateY(${offsets[absIndex] ?? 0}px)` }}
+              >
+                <CommitGraphRow
+                  row={row}
+                  currentBranch={currentBranch}
+                  selected={selected}
+                  visibleColumns={visibleColumns}
+                  exitingLanes={exitingLanes}
+                  pruneAdded={pruneAdded}
+                  slide={pruneSliding}
+                  settling={settling}
+                  onClick={() => { void openCommit(row.commit) }}
+                />
+                {selected && commitDetailNode()}
+              </div>
+            )
+          })}
+        </div>
         {loadingMore && <div className={css.statusLine}>加载中…</div>}
+        {logEnded && logEntries.length >= LOG_MAX_ENTRIES && (
+          <div className={css.statusLine}>已达加载上限（{LOG_MAX_ENTRIES} 条），更深的历史未加载</div>
+        )}
+        {logEnded && logEntries.length > 0 && logEntries.length < LOG_MAX_ENTRIES && (
+          <div className={css.statusLine}>已到最早提交</div>
+        )}
       </div>
     </div>
   )
 }
 
-/** One commit row: SVG lane lines + node + refs + subject. */
+/** One commit row: SVG lane lines + node + refs + subject. Renders only the
+ *  VISIBLE lanes (columns that carry at least one node somewhere in the
+ *  loaded history); node-less passing lanes are hidden. Each kept lane is
+ *  drawn at its original column x and shifted with a CSS transform to its
+ *  projected order, so a change in the visible set animates as a slide. */
 function CommitGraphRow(props: {
   row: GraphRow
   currentBranch?: string
   selected: boolean
+  visibleColumns: number[]
+  exitingLanes: number[]
+  pruneAdded: number[]
+  slide: boolean
+  settling: boolean
   onClick: () => void
 }): ReactNode {
-  const { row, currentBranch, selected, onClick } = props
-  const { commit, lanes, cells, above, below, merges, colors } = row
+  const { row, currentBranch, selected, visibleColumns, exitingLanes, pruneAdded, slide, settling, onClick } = props
+  const { commit, cells, above, below, merges, colors } = row
   const refs = parseRefs(commit.refs, currentBranch)
   const nodeLane = cells.indexOf('node')
-  const lw = laneWidth(lanes)
-  const width = lanes * lw
+  const lw = laneWidth(visibleColumns.length)
+  // Projection: kept lane j renders at its ORDER within visibleColumns. The g
+  // is drawn at its original column (x = j*lw + lw/2) and translated by
+  // (order - j) * lw. A lane EXITING after a prune keeps a "phantom" order =
+  // the slot it would occupy were it still in the set, so the gap closes
+  // around it while it fades out (survivors are already at their final slots).
+  const visIndex = new Map<number, number>()
+  visibleColumns.forEach((j, idx) => visIndex.set(j, idx))
+  for (const j of exitingLanes) {
+    if (visIndex.has(j)) continue
+    let phantom = 0
+    for (const v of visibleColumns) if (v < j) phantom++
+    visIndex.set(j, phantom)
+  }
+  // The row width is the LAST VISIBLE active column's projected order + 1
+  // (merge connectors reach their target lane, so include it). Keeps the note
+  // text pressed against the row's last visible line instead of leaving blank
+  // columns from lanes that happen to have no content in this row. The width
+  // TRANSITIONS with the slide so the text never snaps while lanes settle.
+  let rowMaxOrder = -1
+  const considerOrder = (j: number): void => {
+    const order = visIndex.get(j)
+    if (order !== undefined && order > rowMaxOrder) rowMaxOrder = order
+  }
+  for (let j = 0; j < cells.length; j++) {
+    if (cells[j] !== 'none') considerOrder(j)
+  }
+  for (const j of merges) considerOrder(j)
+  const width = (rowMaxOrder + 1) * lw
   // Ref capsules stack VERTICALLY (one per row) so every branch/tag on a
   // commit stays visible. Each chip is 14px tall with a 3px gap, so a row
   // carrying n refs is max(ROW_H, 17n − 3) tall; the SVG lane drawing grows
   // with it (node re-centered at midY), keeping vertical lines continuous
   // across rows of different heights (top/bottom halves meet at row borders).
-  const refsStackH = refs.length > 0 ? refs.length * 17 - 3 : 0
-  const rowH = Math.max(ROW_H, refsStackH)
+  // rowHeightOf is SHARED with the virtualization offsets so the layout math
+  // can never drift from what is actually rendered.
+  const rowH = rowHeightOf(row, currentBranch)
   const midY = rowH / 2
+  // Merge connectors are drawn INSIDE the node lane's <g>, in that lane's
+  // LOCAL frame (node end at the lane's own x), so they slide rigidly with
+  // the node and never detach from it mid-transition. At the final positions
+  // the local coordinates are exact for BOTH ends, so the corner meets the
+  // target lane's line correctly once the slide settles.
+  const nodeOrder = visIndex.get(nodeLane)
+  const connectorPaths = nodeLane >= 0 && nodeOrder !== undefined
+    ? merges.filter(j => j !== nodeLane && visIndex.has(j)).map(j => {
+        const targetOrder = visIndex.get(j)!
+        const x1 = nodeLane * lw + lw / 2
+        const x2 = targetOrder * lw + lw / 2 - (nodeOrder - nodeLane) * lw
+        const color = laneColor(colors[j] ?? j)
+        const dirX = x2 > x1 ? 1 : -1
+        const hx = x2 - dirX * MERGE_R
+        // Rounded quadratic corner (no SVG arc sweep ambiguity): horizontal
+        // run from the node, then a smooth 90° turn into the target lane's
+        // line — down when the lane continues below, up when it ends here.
+        const dirY = below[j] ? 1 : -1
+        const d = `M ${x1} ${midY} H ${hx} Q ${x2} ${midY} ${x2} ${midY + dirY * MERGE_R}`
+        return (
+          <path
+            key={`m${j}`}
+            d={d}
+            fill="none"
+            stroke={color}
+            strokeWidth={1.5}
+            strokeLinecap="round"
+          />
+        )
+      })
+    : null
   return (
     <div
       className={`${css.graphRow}${selected ? ' ' + css.graphRowSelected : ''}`}
@@ -516,9 +1045,19 @@ function CommitGraphRow(props: {
       title={commit.subject}
       role="button"
     >
-      <svg className={css.graphSvg} width={width} height={rowH} style={{ minWidth: width }}>
+      <svg
+        className={css.graphSvg}
+        width={width}
+        height={rowH}
+        style={{
+          width,
+          minWidth: width,
+          transition: settling ? `width ${SLIDE_MS}ms ease` : 'none',
+        }}
+      >
         {cells.map((cell, j) => {
-          if (cell === 'none') return null
+          const order = visIndex.get(j)
+          if (cell === 'none' || order === undefined) return null // hidden lane
           const x = j * lw + lw / 2
           const color = laneColor(colors[j] ?? j)
           const segs: ReactNode[] = []
@@ -552,30 +1091,27 @@ function CommitGraphRow(props: {
                 strokeWidth={1.5}
               />,
             )
+            if (connectorPaths !== null) segs.push(...connectorPaths)
           }
-          return <g key={j}>{segs}</g>
-        })}
-        {nodeLane >= 0 && merges.map(j => {
-          if (j === nodeLane) return null
-          const x1 = nodeLane * lw + lw / 2
-          const x2 = j * lw + lw / 2
-          const color = laneColor(colors[j] ?? j)
-          const dirX = x2 > x1 ? 1 : -1
-          const hx = x2 - dirX * MERGE_R
-          // Rounded quadratic corner (no SVG arc sweep ambiguity): horizontal
-          // run from the node, then a smooth 90° turn into the target lane's
-          // line — down when the lane continues below, up when it ends here.
-          const dirY = below[j] ? 1 : -1
-          const d = `M ${x1} ${midY} H ${hx} Q ${x2} ${midY} ${x2} ${midY + dirY * MERGE_R}`
+          // Per-lane enter/exit fades, prune only: an exiting lane fades out
+          // in place (survivors slide around it); a lane added by the same
+          // prune fades in. Mid-scroll grows never animate (they snap).
+          const animClass = exitingLanes.includes(j)
+            ? css.laneExit
+            : pruneAdded.includes(j)
+              ? css.laneEnter
+              : undefined
           return (
-            <path
-              key={`m${j}`}
-              d={d}
-              fill="none"
-              stroke={color}
-              strokeWidth={1.5}
-              strokeLinecap="round"
-            />
+            <g
+              key={j}
+              className={animClass}
+              style={{
+                transform: `translateX(${(order - j) * lw}px)`,
+                transition: slide ? `transform ${SLIDE_MS}ms ease` : 'none',
+              }}
+            >
+              {segs}
+            </g>
           )
         })}
       </svg>
