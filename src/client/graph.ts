@@ -1,4 +1,4 @@
-﻿import type { GitLogEntry } from './api'
+import type { GitLogEntry } from './api'
 
 /** How a commit row occupies a single lane column. */
 export type GraphCell = 'none' | 'line' | 'node' | 'merge'
@@ -9,6 +9,13 @@ export interface GraphRow {
   commit: GitLogEntry
   /** Number of lanes in the row (SVG width = lanes * 16). */
   lanes: number
+  /**
+   * Snapshot of how many lanes are ACTUALLY in use by this row (non-empty
+   * cells — holes/blank columns don't count). This is the number that grows
+   * on a branch fork and shrinks on a merge, so the UI can show the lane
+   * count correctly following the loaded history.
+   */
+  activeLanes: number
   /** Per-lane cell kind. `node` appears exactly once. */
   cells: GraphCell[]
   /** Per-lane: draw a vertical segment from the row top to the mid line. */
@@ -20,7 +27,7 @@ export interface GraphRow {
   /**
    * Per-lane palette index. Colors follow the BRANCH FLOW, not the lane
    * number: a commit inherits the color of the lane it continues, so a branch
-   * keeps one color even when it weaves between lanes; freed lanes get a
+   * keeps one color even if it weaves between lanes; freed lanes get a
    * fresh color when a new branch takes them over.
    */
   colors: number[]
@@ -234,14 +241,19 @@ export function createGraphLayout(currentBranch?: string): GraphLayoutWalker {
         // Trim trailing empty lanes: a row's width is its LAST active lane, so
         // sparse early history does not leave blank columns on the right.
         let lastActive = -1
+        let activeCount = 0
         for (let j = 0; j < laneCount; j++) {
-          if (cells[j] !== 'none') lastActive = j
+          if (cells[j] !== 'none') {
+            lastActive = j
+            activeCount++
+          }
         }
         const rowLanes = lastActive + 1
 
         rows.push({
           commit,
           lanes: rowLanes,
+          activeLanes: activeCount,
           cells: cells.slice(0, rowLanes),
           above: above.slice(0, rowLanes),
           below: below.slice(0, rowLanes),

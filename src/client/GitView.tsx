@@ -185,6 +185,17 @@ export function GitView(props: TabComponentProps): ReactNode {
   // The window is recomputed on scroll; offsets only when rows/expansion/
   // detail-height change (append, expand, drag) — never on scroll.
   const [windowRange, setWindowRange] = useState({ start: 0, end: 0 })
+  // Lane-count snapshot of the rows currently in the render window — follows
+  // both paged loading (rows grow) and scrolling (the window moves), so the
+  // UI shows forks (+1) and merges (−1) exactly as they are browsed.
+  const windowActiveLanes = useMemo(() => {
+    let max = 0
+    for (let i = windowRange.start; i < windowRange.end && i < rows.length; i++) {
+      const a = rows[i]!.activeLanes
+      if (a > max) max = a
+    }
+    return max
+  }, [rows, windowRange])
   // offsets live in a ref so updateWindow (defined early, used by loadAll)
   // can read the latest offsets without recreating itself on every change.
   const offsetsRef = useRef<number[]>([])
@@ -693,7 +704,10 @@ export function GitView(props: TabComponentProps): ReactNode {
       )}
 
       {/* ── History: commit graph (virtualized + lazy-loads) ── */}
-      <div className={css.sectionTitle}>历史</div>
+      <div className={css.sectionTitle}>
+        历史
+        {windowActiveLanes > 0 && <span className={css.branchTag} title="当前窗口内活跃的分支泳道数（分支 +1、合并 −1）">泳道 {windowActiveLanes}</span>}
+      </div>
       <div className={css.logList} ref={listRef} onScroll={onListScroll}>
         {/* Spacer carries the scrollbar; only the visible window is in the DOM. */}
         <div className={css.logSpacer} style={{ height: totalHeight }}>
