@@ -13,14 +13,14 @@
  * The exclude list (`.dsh-bs-git-excludes` in the session cwd) is edited in
  * the sidebar settings panel (the tab's gear): one directory name per line.
  */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { IconBranchOutline16, IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TabComponentProps } from 'dsh-better-sidebar/client/service'
 import { api } from './api.ts'
 import type { GitLogEntry, GitRepo, GitStatusEntry } from './api.ts'
-import { laneColor, layoutGraph, parseRefs } from './graph.ts'
-import type { GraphRow } from './graph.ts'
+import { createGraphLayout, laneColor, parseRefs } from './graph.ts'
+import type { GraphLayoutWalker, GraphRow } from './graph.ts'
 import { DiffBlock } from './DiffBlock.tsx'
 import css from './git-view.module.css'
 
@@ -118,6 +118,22 @@ export function GitView(props: TabComponentProps): ReactNode {
   // hash-change reload) bumps this counter; a loadMoreLog that started before
   // the bump discards its result instead of appending stale/offset batches.
   const logEpoch = useRef(0)
+  // Incremental commit-graph layout: the walker keeps the lane state across
+  // appends, so loading another batch costs O(batch) instead of re-laying-out
+  // the whole history. `rows` mirrors logEntries 1:1 (row i renders entry i).
+  const layoutRef = useRef<GraphLayoutWalker | null>(null)
+  const [rows, setRows] = useState<GraphRow[]>([])
+  // Mirror of the current branch (see below — synced during render after the
+  // status-derived value exists), so layout rebuilds from async callbacks use
+  // the LATEST branch instead of a stale render-time closure.
+  const branchRef = useRef<string | undefined>(undefined)
+
+  /** Rebuild the graph walker from scratch for a full entry list (repo switch,
+   *  refresh, branch change). Uses the live branch via branchRef. */
+  const rebuildLayout = useCallback((entries: GitLogEntry[]): void => {
+    layoutRef.current = createGraphLayout(branchRef.current)
+    setRows(layoutRef.current.append(entries))
+  }, [])
 
   // Remember the user's repo selection per session+cwd; a remembered root
   // that is gone (excluded / deleted / different workspace) falls back to
@@ -173,6 +189,7 @@ export function GitView(props: TabComponentProps): ReactNode {
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
       logSkipRef.current = 0
+      rebuildLayout(logResult.entries)
       setDiffView(null)
       setCommitDetail(null)
       setFileDiff(null)
@@ -184,7 +201,7 @@ export function GitView(props: TabComponentProps): ReactNode {
     } finally {
       if (epoch === logEpoch.current) setLoading(false)
     }
-  }, [scope.sessionId, scope.cwd])
+  }, [scope.sessionId, scope.cwd, rebuildLayout])
 
   useEffect(() => { void loadRepos() }, [loadRepos])
   useEffect(() => { void loadAll(currentRoot) }, [currentRoot, loadAll])
@@ -205,12 +222,13 @@ export function GitView(props: TabComponentProps): ReactNode {
       setLogEntries(logResult.entries)
       setLogEnded(logResult.entries.length < LOG_BATCH)
       logSkipRef.current = 0
+      rebuildLayout(logResult.entries)
     } catch (reason) {
       if (epoch === logEpoch.current) {
         setError(reason instanceof Error ? reason.message : String(reason))
       }
     }
-  }, [currentRoot, scope.sessionId, scope.cwd])
+  }, [currentRoot, scope.sessionId, scope.cwd, rebuildLayout])
 
   /** Refresh just the status (worktree changes don't touch .git, so the
    *  watcher never pings for them). Kept separate from the log so returning
@@ -330,7 +348,11 @@ export function GitView(props: TabComponentProps): ReactNode {
     try {
       const result = await api.log(currentRoot, scope, LOG_BATCH, skip)
       if (epoch !== logEpoch.current) return // a reset happened mid-flight: drop
+      // Append both the entries and their graph rows — the walker only lays
+      // out the NEW batch, so deep browsing stays O(batch) per page.
       setLogEntries(prev => [...prev, ...result.entries])
+      const newRows = layoutRef.current?.append(result.entries) ?? []
+      setRows(prev => [...prev, ...newRows])
       setLogEnded(result.entries.length < LOG_BATCH)
       logSkipRef.current = skip
     } catch (reason) {
@@ -412,7 +434,17 @@ export function GitView(props: TabComponentProps): ReactNode {
     repos.find(repo => repo.root === root)?.name ?? (root === null ? '—' : root.slice(root.lastIndexOf('\\') + 1))
 
   const currentBranch = status?.branch
-  const rows = useMemo(() => layoutGraph(logEntries, currentBranch), [logEntries, currentBranch])
+  // Keep the layout rebuilds (async callbacks) on the LATEST branch value.
+  branchRef.current = currentBranch
+
+  // The branch feeds the graph's fork rule; when it changes (checkout / reset
+  // surfaced by a status refresh) re-lay-out the whole loaded history. The
+  // epoch bump invalidates any loadMoreLog still in flight.
+  useEffect(() => {
+    if (layoutRef.current === null) return // nothing laid out yet (mount)
+    ++logEpoch.current
+    rebuildLayout(logEntriesRef.current)
+  }, [currentBranch, rebuildLayout])
 
   /** Drag the commit-detail resize handle to change the box height (120–560px). */
   const onDetailHandleDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
