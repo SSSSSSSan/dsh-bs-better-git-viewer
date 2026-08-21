@@ -241,6 +241,8 @@ export function GitView(props: TabComponentProps): ReactNode {
     if (root === null) {
       setStatus(null)
       setLogEntries([])
+      layoutRef.current = null
+      setRows([])
       setLoading(false)
       return
     }
